@@ -46,21 +46,22 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
 
     def scale_mean_stddev(self, inputs):
         """
-        Compute the moments of the posterior of reflection observation scale factors. 
+        Compute the moments of the posterior of reflection observation scale factors.
 
         Parameters
         ----------
         inputs : data
-            inputs is a data structure like [refl_id, image_id, metadata, intensity, uncertainty]. 
-            This can be a tf.DataSet, or a group of tensors. 
+            inputs is a data structure like [refl_id, image_id, metadata, intensity, uncertainty].
+            This can be a tf.DataSet, or a group of tensors.
 
         Returns
         -------
         mean : np.array
-            A numpy array containing the mean value of the scale predicted by the model for each input. 
+            A numpy array containing the mean value of the scale predicted by the model for each input.
         stddev : np.array
-            A numpy array containing the standard deviation of the scale predicted by the model for each input. 
+            A numpy array containing the standard deviation of the scale predicted by the model for each input.
             This is a reasonable estimate of the uncertainty of the model about each input.
+
         """
         refl_id = self.get_refl_id(inputs)
 
@@ -82,15 +83,15 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         Parameters
         ----------
         inputs : data
-            inputs is a data structure like [refl_id, image_id, metadata, intensity, uncertainty]. 
-            This can be a tf.DataSet, or a group of tensors. 
+            inputs is a data structure like [refl_id, image_id, metadata, intensity, uncertainty].
+            This can be a tf.DataSet, or a group of tensors.
 
         Returns
         -------
         mean : np.array
-            A numpy array containing the mean value predicted by the model for each input. 
+            A numpy array containing the mean value predicted by the model for each input.
         stddev : np.array
-            A numpy array containing the standard deviation predicted by the model for each input. 
+            A numpy array containing the standard deviation predicted by the model for each input.
             This is a reasonable estimate of the uncertainty of the model about each input.
         """
         refl_id = self.get_refl_id(inputs)
@@ -105,6 +106,9 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         q = self.surrogate_posterior
         f4 = q.moment_4(method='scipy')
 
+        if tf.is_tensor(f4):
+            f4 = f4.numpy()
+
         s2 = np.square(scale_dist.mean().numpy()) + np.square(scale_dist.stddev().numpy())
         # var(I) = <I^2> - <I>^2
         # <I^2> = <F^4><Sigma^2>
@@ -116,7 +120,11 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
             likelihood = self.likelihood(inputs)
             iexp = likelihood.convolve(iexp)
             ivar = likelihood.convolve(ivar)
-            iexp,ivar = iexp.numpy(),ivar.numpy()
+            # Ensure output is numpy if convolution returned tensors
+            if tf.is_tensor(iexp):
+                iexp = iexp.numpy()
+            if tf.is_tensor(ivar):
+                ivar = ivar.numpy()
 
         return iexp,np.sqrt(ivar)
 

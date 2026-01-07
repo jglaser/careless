@@ -58,5 +58,29 @@ args_and_kwargs = (
         "action" : "store_true",
         "default" : False,
     }),
-    
+    (("--surrogate-posterior",), {
+        "help": "Type of surrogate posterior distribution. 'truncated_normal' assumes independent structure factors (Mean Field). "
+                "'flow' uses a Normalizing Flow to capture correlations and non-Gaussian shapes. Default: 'truncated_normal'",
+        "type": str,
+        "default": "truncated_normal",
+        "choices": ["truncated_normal", "flow"]
+    }),
+
+    (("--flow-depth",), {
+        "help": "Number of bijector layers for the normalizing flow posterior. Only used if --surrogate-posterior=flow. Default: 2",
+        "type": int,
+        "default": 2,
+    }),
+
+    (("--flow-hidden-units",), {
+        "help": "Number of hidden units in the autoregressive network of the flow. Default: 16",
+        "type": int,
+        "default": 16,
+    }),
+    (("--flow-inference-samples",), {
+        "help": "Number of Monte Carlo samples used to estimate mean and stddev for Flow posteriors during inference (MTZ output). "
+                "Higher values give more precise moments but are slower and use more memory. Default: 100",
+        "type": int,
+        "default": 100,
+    }),
 )
