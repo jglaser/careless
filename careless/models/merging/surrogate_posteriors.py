@@ -174,7 +174,8 @@ class RiceWoolfson(tfd.Distribution):
 
 class FlowPosterior(SurrogatePosterior):
     """
-    A Surrogate Posterior parameterized by a Masked Autoregressive Flow (MAF).
+    A Surrogate Posterior parameterized by an Inverse Autoregressive Flow (IAF).
+    IAF allows for parallel sampling, which is critical for the speed of Variational Inference.
     """
     def __init__(self, loc, scale, depth=2, hidden_units=16, inference_samples=100, name='FlowPosterior', **kwargs):
         """
@@ -200,12 +201,16 @@ class FlowPosterior(SurrogatePosterior):
 
         bijectors = []
         for i in range(depth):
-            bijectors.append(tfb.MaskedAutoregressiveFlow(
+            # Standard MAF is slow for sampling (O(D)).
+            # Inverted MAF (IAF) is fast for sampling (O(1)).
+            maf = tfb.MaskedAutoregressiveFlow(
                 shift_and_log_scale_fn=masked_autoregressive_default_template(
                     hidden_layers=[hidden_units, hidden_units]
                 )
-            ))
-            # Permute to mix dimensions
+            )
+            bijectors.append(tfb.Invert(maf))
+
+            # Permute to mix dimensions (Permute is fast both ways)
             bijectors.append(tfb.Permute(permutation=np.random.permutation(n_dims)))
 
         # Enforce positivity
@@ -224,15 +229,12 @@ class FlowPosterior(SurrogatePosterior):
 
     @property
     def parameters(self):
-        # Override to expose only tensor parameters for output files.
-        # This hides the 'bijector' chain which causes crashes in get_results.
         return {
             'loc': self.base_loc,
             'scale': self.base_scale
         }
 
     def parameter_properties(self, dtype=tf.float32, num_classes=None):
-        # Override to match the keys in self.parameters
         return {
             'loc': tfp.util.ParameterProperties(),
             'scale': tfp.util.ParameterProperties()
@@ -245,18 +247,18 @@ class FlowPosterior(SurrogatePosterior):
         return tf.reduce_mean(self.distribution.sample(n_samples), axis=0)
 
     @tf.function
-    def stddev(self, n_samples=100):
+    def stddev(self, n_samples=None):
         if n_samples is None:
             n_samples = self.inference_samples
         return tf.math.reduce_std(self.distribution.sample(n_samples), axis=0)
 
     @tf.function
-    def moment_4(self, n_samples=100, **kwargs):
+    def moment_4(self, n_samples=None, **kwargs):
         if n_samples is None:
             n_samples = self.inference_samples
         samples = self.distribution.sample(n_samples)
         return tf.reduce_mean(tf.pow(samples, 4), axis=0)
 
     @classmethod
-    def from_loc_and_scale(cls, loc, scale, depth=2, hidden_units=16, **kwargs):
-        return cls(loc, scale, depth=depth, hidden_units=hidden_units, **kwargs)
+    def from_loc_and_scale(cls, loc, scale, depth=2, hidden_units=16, inference_samples=100, **kwargs):
+        return cls(loc, scale, depth=depth, hidden_units=hidden_units, inference_samples=inference_samples, **kwargs)
