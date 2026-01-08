@@ -86,7 +86,8 @@ def run_careless(parser):
             n_particles=parser.n_particles,
             b_factor=parser.b_factor_prior,
             learning_rate=parser.learning_rate,
-            temperatures=temps
+            temperatures=temps,
+            use_positivity=parser.use_positivity, # Controlled by --disable-positivity
         )
 
         # Compile needed for fit()
@@ -173,22 +174,53 @@ def run_careless(parser):
         jit_compile=parser.jit_compile,
     )
 
-    # --- RESULT EXTRACTION ---
     if parser.algorithm == 'careleast':
-        # Custom extraction for Careleast (FFT + Averaging)
-        # We need to compute the "Mean Posterior" structure factors from the samples
-        # Ideally, we would average the intensities or Fs over the trajectory.
-        # For now, let's take the final state of the coldest chain.
-
+        # --- CARELEAST RESULT EXTRACTION ---
         print("Extracting phases from coldest chain...")
-        final_density = model.density[0] # Coldest chain
-        F_complex = model._fft_forward(final_density[None, ...])[0]
+        final_density = model.density[0] # Coldest chain (Index 0)
 
-        # Map back to HKLs to write MTZ
-        # (You will need to implement the reverse mapping from grid to sparse HKLs
-        #  inside DataManager or here to create the output DataSet)
-        pass
-        # logic to write MTZ similar to standard careless
+        # Forward FFT to getting Complex F on P1 grid
+        F_grid = model._fft_forward(final_density[None, ...])[0]
+        F_grid_np = F_grid.numpy()
+        nx, ny, nz = model.grid_size
+
+        for i, rasu in enumerate(dm.asu_collection.reciprocal_asus):
+            # Get unique HKLs for this ASU
+            hkls = rasu.lookup_table.get_hkls().astype(np.int32)
+            h, k, l = hkls.T
+
+            # Map sparse HKLs to dense grid indices (handling wrapping)
+            h_idx = np.mod(h, nx)
+            k_idx = np.mod(k, ny)
+            l_idx = np.mod(l, nz)
+
+            # Gather complex Structure Factors
+            F_values = F_grid_np[h_idx, k_idx, l_idx]
+
+            # Build Output DataSet
+            ds = rs.DataSet({
+                'H': h,
+                'K': k,
+                'L': l,
+                'F': np.abs(F_values).astype(np.float32),
+                'PHI': np.rad2deg(np.angle(F_values)).astype(np.float32),
+                'I': np.square(np.abs(F_values)).astype(np.float32),
+                # Sigmas are unknown/undefined for single-sample extraction
+                'SigF': np.zeros_like(h, dtype=np.float32),
+                'SigI': np.zeros_like(h, dtype=np.float32),
+            }, cell=rasu.cell, spacegroup=rasu.spacegroup).infer_mtz_dtypes()
+
+            # Reformat anomalous data if necessary
+            if rasu.anomalous:
+                ds = ds.set_index(['H', 'K', 'L']).unstack_anomalous()
+
+            filename = parser.output_base + f'_{i}.mtz'
+            print(f"Writing {filename}...")
+            ds.write_mtz(filename)
+
+        # Also save the raw density map (MRC/CCP4 format equivalent)
+        # We can dump it to a numpy file or simple map file for inspection
+        np.save(parser.output_base + '_density.npy', final_density.numpy())
     else:
         for i,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=train)):
             filename = parser.output_base + f'_{i}.mtz'
