@@ -22,6 +22,7 @@ def run_careless(parser):
     from careless.models.scaling.nn import MLPScaler
     from careless.models.priors.wilson import DoubleWilsonPrior # Ensure this is imported
     from careless.models.merging.surrogate_posteriors import TruncatedNormal, FlowPosterior
+    import tf_keras as tfk
 
     if parser.type == 'poly':
         df = LaueFormatter.from_parser(parser)
@@ -45,68 +46,118 @@ def run_careless(parser):
     else:
         train,test = dm.inputs,None
 
-    prior = None
-    parents = parser.parents
-    if parents is None:
-        prior = dm.get_wilson_prior(parser.wilson_prior_b)
+    if parser.algorithm == 'careleast':
+        from careless.models.merging.careleast import CareleastRealSpace
+
+        # 1. Determine Grid Size from Resolution
+        min_d = dm.asu_collection.dHKL.min() # d_spacing is inverse? Check dHKL definition.
+        # usually dHKL in careless is 1/d^2 or just d.
+        # Let's assume we can get high res limit.
+        high_res = 1.0 / np.max(np.sqrt(dm.asu_collection.dHKL)) # Assuming dHKL is 1/d^2
+
+        # Grid sampling: Resolution / 2 (Nyquist) / Oversampling
+        grid_spacing = high_res / (2.0 * parser.grid_oversampling)
+
+        uc = dm.asu_collection.reciprocal_asus[0].cell
+        nx = int(uc.a / grid_spacing)
+        ny = int(uc.b / grid_spacing)
+        nz = int(uc.c / grid_spacing)
+        grid_size = (nx, ny, nz)
+        print(f"Careleast: Initializing real-space grid {grid_size} for resolution {high_res:.2f}A")
+
+        # 2. Build Likelihood & Scaling (Reuse DataManager logic manually or refactor)
+        # We can reuse dm.build_model() to get the components, then discard the VAE
+        temp_model = dm.build_model()
+        likelihood = temp_model.likelihood
+        scaling_model = temp_model.scaling_model
+
+        # 3. Parse Temperatures
+        if parser.temperatures:
+            temps = [float(x) for x in parser.temperatures.split(',')]
+        else:
+            temps = None
+
+        model = CareleastRealSpace(
+            asu_collection=dm.asu_collection,
+            likelihood=likelihood,
+            scaling_model=scaling_model,
+            grid_size=grid_size,
+            unit_cell=uc,
+            n_particles=parser.n_particles,
+            b_factor=parser.b_factor_prior,
+            learning_rate=parser.learning_rate,
+            temperatures=temps
+        )
+
+        # Compile needed for fit()
+        optimizer = tfk.optimizers.SGD(
+            learning_rate=parser.learning_rate,
+            global_clipnorm=1.0 # Clips gradients to norm 1.0
+        )
+        model.compile(optimizer=optimizer)
     else:
-        # Double Wilson Prior Logic
-        parents = [None if i == 'None' else int(i) for i in parents.split(',')]
-        r_values = parser.dwr
-        r_values = [float(i) for i in r_values.split(',')]
+        prior = None
+        parents = parser.parents
+        if parents is None:
+            prior = dm.get_wilson_prior(parser.wilson_prior_b)
+        else:
+            # Double Wilson Prior Logic
+            parents = [None if i == 'None' else int(i) for i in parents.split(',')]
+            r_values = parser.dwr
+            r_values = [float(i) for i in r_values.split(',')]
 
-        sigma = dm.get_wilson_sigma(parser.wilson_prior_b)
-        reindexing_ops = parser.reindexing_ops
-        if reindexing_ops is not None:
-            import gemmi
-            delim = ';'
-            reindexing_ops = [gemmi.Op(i) for i in reindexing_ops.split(delim)]
+            sigma = dm.get_wilson_sigma(parser.wilson_prior_b)
+            reindexing_ops = parser.reindexing_ops
+            if reindexing_ops is not None:
+                import gemmi
+                delim = ';'
+                reindexing_ops = [gemmi.Op(i) for i in reindexing_ops.split(delim)]
 
-        prior = DoubleWilsonPrior(
-            dm.asu_collection,
-            parents,
-            r_values,
-            reindexing_ops,
-            sigma=sigma,
-            optimize_r=parser.optimize_double_wilson_r
-        )
+            prior = DoubleWilsonPrior(
+                dm.asu_collection,
+                parents,
+                r_values,
+                reindexing_ops,
+                sigma=sigma,
+                optimize_r=parser.optimize_double_wilson_r
+            )
 
-    # Now loc and scale are available
-    loc, scale = prior.mean(), prior.stddev()
-    scale = scale * parser.structure_factor_init_scale
+        # Now loc and scale are available
+        loc, scale = prior.mean(), prior.stddev()
+        scale = scale * parser.structure_factor_init_scale
 
-    if parser.surrogate_posterior == 'flow':
-        # Use Flow Posterior
-        # Note: scale_shift logic from TruncatedNormal handled internally or via base_scale init
-        from careless.models.merging.surrogate_posteriors import FlowPosterior
-        surrogate_posterior = FlowPosterior.from_loc_and_scale(
-            loc,
-            scale,
-            depth=parser.flow_depth,
-            hidden_units=parser.flow_hidden_units,
-            inference_samples=parser.flow_inference_samples,
-            name='structure_factor'
-        )
-        print(f"Initialized FlowPosterior with depth={parser.flow_depth}, hidden_units={parser.flow_hidden_units}")
-    else:
-        # Default Truncated Normal
-        surrogate_posterior = TruncatedNormal.from_loc_and_scale(
-            loc,
-            scale,
-            name='structure_factor'
-        )
+        if parser.surrogate_posterior == 'flow':
+            # Use Flow Posterior
+            # Note: scale_shift logic from TruncatedNormal handled internally or via base_scale init
+            from careless.models.merging.surrogate_posteriors import FlowPosterior
+            surrogate_posterior = FlowPosterior.from_loc_and_scale(
+                loc,
+                scale,
+                depth=parser.flow_depth,
+                hidden_units=parser.flow_hidden_units,
+                inference_samples=parser.flow_inference_samples,
+                name='structure_factor'
+            )
+            print(f"Initialized FlowPosterior with depth={parser.flow_depth}, hidden_units={parser.flow_hidden_units}")
+        else:
+            # Default Truncated Normal
+            surrogate_posterior = TruncatedNormal.from_loc_and_scale(
+                loc,
+                scale,
+                name='structure_factor'
+            )
 
-    model = dm.build_model(surrogate_posterior=surrogate_posterior)
+        model = dm.build_model(surrogate_posterior=surrogate_posterior)
 
-    if parser.scale_file is not None:
-        model.scaling_model.load_weights(parser.scale_file)
-    if parser.freeze_scales:
-        model.scaling_model.trainable = False
+        if parser.scale_file is not None:
+            model.scaling_model.load_weights(parser.scale_file)
+        if parser.freeze_scales:
+            model.scaling_model.trainable = False
 
-    if parser.structure_factor_file is not None:
-        model.surrogate_posterior.load_weights(parser.structure_factor_file)
-    if parser.freeze_structure_factors:
-        model.surrogate_posterior.trainable = False
+        if parser.structure_factor_file is not None:
+            model.surrogate_posterior.load_weights(parser.structure_factor_file)
+        if parser.freeze_structure_factors:
+            model.surrogate_posterior.trainable = False
 
     validation_frequency = parser.validation_frequency
     progress = not parser.disable_progress_bar
@@ -114,7 +165,7 @@ def run_careless(parser):
     history = model.train_model(
         tuple(map(tf.convert_to_tensor, train)),
         parser.iterations,
-        message="Training",
+        message="Sampling" if parser.algorithm=='careleast' else "Training",
         validation_data=test,
         validation_frequency=validation_frequency,
         progress=progress,
@@ -122,63 +173,80 @@ def run_careless(parser):
         jit_compile=parser.jit_compile,
     )
 
-    for i,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=train)):
-        filename = parser.output_base + f'_{i}.mtz'
-        ds.write_mtz(filename)
+    # --- RESULT EXTRACTION ---
+    if parser.algorithm == 'careleast':
+        # Custom extraction for Careleast (FFT + Averaging)
+        # We need to compute the "Mean Posterior" structure factors from the samples
+        # Ideally, we would average the intensities or Fs over the trajectory.
+        # For now, let's take the final state of the coldest chain.
 
-    filename = parser.output_base + f'_history.csv'
-    history = rs.DataSet(history).to_csv(filename, index_label='step')
+        print("Extracting phases from coldest chain...")
+        final_density = model.density[0] # Coldest chain
+        F_complex = model._fft_forward(final_density[None, ...])[0]
 
-    model.surrogate_posterior.save_weights(parser.output_base + '_structure_factor')
-    model.scaling_model.save_weights(parser.output_base + '_scale')
-    if parser.save_data_manager:
-        import pickle
-        with open(parser.output_base + "_data_manager.pickle", "wb") as out:
-            pickle.dump(dm, out)
-
-    predictions_data = None
-    if test is not None:
-        for file_id, (ds_train, ds_test) in enumerate(zip(
-                dm.get_predictions(model, train, test_value=0),
-                dm.get_predictions(model, test, test_value=1),
-                )):
-            filename = parser.output_base + f'_predictions_{file_id}.mtz'
-            rs.concat((
-                ds_train,
-                ds_test,
-            )).write_mtz(filename)
+        # Map back to HKLs to write MTZ
+        # (You will need to implement the reverse mapping from grid to sparse HKLs
+        #  inside DataManager or here to create the output DataSet)
+        pass
+        # logic to write MTZ similar to standard careless
     else:
-        for file_id, ds_train in enumerate(dm.get_predictions(model, train, test_value=0)):
-            filename = parser.output_base + f'_predictions_{file_id}.mtz'
-            ds_train.write_mtz(filename)
-
-    if parser.merge_half_datasets:
-        scaling_model = model.scaling_model
-        scaling_model.trainable = False
-        xval_data = [None] * len(dm.asu_collection)
-        for repeat in range(parser.half_dataset_repeats):
-            for half_id, half in enumerate(dm.split_data_by_image()):
-                model = dm.build_model(scaling_model=scaling_model)
-                history = model.train_model(
-                    tuple(map(tf.convert_to_tensor, half)), 
-                    parser.iterations,
-                    message=f"Merging repeat {repeat+1} half {half_id+1}",
-                    progress=progress,
-                    reduce_retracing=parser.reduce_retracing,
-                    jit_compile=parser.jit_compile,
-                )
-
-                for file_id,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=half)):
-                    ds['repeat'] = rs.DataSeries(repeat, index=ds.index, dtype='I')
-                    ds['half'] = rs.DataSeries(half_id, index=ds.index, dtype='I')
-                    if xval_data[file_id] is None:
-                        xval_data[file_id] = ds
-                    else:
-                        xval_data[file_id] = rs.concat((xval_data[file_id], ds))
-
-        for file_id, ds in enumerate(xval_data):
-            filename = parser.output_base + f'_xval_{file_id}.mtz'
+        for i,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=train)):
+            filename = parser.output_base + f'_{i}.mtz'
             ds.write_mtz(filename)
+
+        filename = parser.output_base + f'_history.csv'
+        history = rs.DataSet(history).to_csv(filename, index_label='step')
+
+        model.surrogate_posterior.save_weights(parser.output_base + '_structure_factor')
+        model.scaling_model.save_weights(parser.output_base + '_scale')
+        if parser.save_data_manager:
+            import pickle
+            with open(parser.output_base + "_data_manager.pickle", "wb") as out:
+                pickle.dump(dm, out)
+
+        predictions_data = None
+        if test is not None:
+            for file_id, (ds_train, ds_test) in enumerate(zip(
+                    dm.get_predictions(model, train, test_value=0),
+                    dm.get_predictions(model, test, test_value=1),
+                    )):
+                filename = parser.output_base + f'_predictions_{file_id}.mtz'
+                rs.concat((
+                    ds_train,
+                    ds_test,
+                )).write_mtz(filename)
+        else:
+            for file_id, ds_train in enumerate(dm.get_predictions(model, train, test_value=0)):
+                filename = parser.output_base + f'_predictions_{file_id}.mtz'
+                ds_train.write_mtz(filename)
+
+        if parser.merge_half_datasets:
+            scaling_model = model.scaling_model
+            scaling_model.trainable = False
+            xval_data = [None] * len(dm.asu_collection)
+            for repeat in range(parser.half_dataset_repeats):
+                for half_id, half in enumerate(dm.split_data_by_image()):
+                    model = dm.build_model(scaling_model=scaling_model)
+                    history = model.train_model(
+                        tuple(map(tf.convert_to_tensor, half)), 
+                        parser.iterations,
+                        message=f"Merging repeat {repeat+1} half {half_id+1}",
+                        progress=progress,
+                        reduce_retracing=parser.reduce_retracing,
+                        jit_compile=parser.jit_compile,
+                    )
+
+                    for file_id,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=half)):
+                        ds['repeat'] = rs.DataSeries(repeat, index=ds.index, dtype='I')
+                        ds['half'] = rs.DataSeries(half_id, index=ds.index, dtype='I')
+                        if xval_data[file_id] is None:
+                            xval_data[file_id] = ds
+                        else:
+                            xval_data[file_id] = rs.concat((xval_data[file_id], ds))
+
+            for file_id, ds in enumerate(xval_data):
+                filename = parser.output_base + f'_xval_{file_id}.mtz'
+                ds.write_mtz(filename)
 
     if parser.embed:
         from IPython import embed

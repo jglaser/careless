@@ -14,6 +14,7 @@ from . import (
     prior,
     scaling,
     tf_options,
+    careleast,
 )
 
 groups = [
@@ -26,6 +27,7 @@ groups = [
     positional_encoding,
     prior,
     scaling,
+    careleast,
     tf_options
 ]
 
