@@ -46,8 +46,8 @@ def run_careless(parser):
     else:
         train,test = dm.inputs,None
 
-    if parser.algorithm == 'careleast':
-        from careless.models.merging.careleast import CareleastRealSpace
+    if parser.algorithm.startswith('careleast'):
+        from careless.models.merging.careleast import CareleastRealSpace, CareleastReciprocalSpace
 
         # 1. Determine Grid Size from Resolution
         min_d = dm.asu_collection.dHKL.min() # d_spacing is inverse? Check dHKL definition.
@@ -77,24 +77,37 @@ def run_careless(parser):
         else:
             temps = None
 
-        model = CareleastRealSpace(
-            asu_collection=dm.asu_collection,
-            likelihood=likelihood,
-            scaling_model=scaling_model,
-            grid_size=grid_size,
-            unit_cell=uc,
-            n_particles=parser.n_particles,
-            b_factor=parser.b_factor_prior,
-            learning_rate=parser.learning_rate,
-            temperatures=temps,
-            use_positivity=parser.use_positivity, # Controlled by --disable-positivity
-        )
+        if parser.algorithm == 'careleast_real':
+            print(f"Careleast: Real-Space SGLD. Grid: {grid_size}")
+            model = CareleastRealSpace(
+                asu_collection=dm.asu_collection,
+                likelihood=likelihood,
+                scaling_model=scaling_model,
+                grid_size=grid_size,
+                unit_cell=uc,
+                n_particles=parser.n_particles,
+                b_factor=parser.b_factor_prior,
+                learning_rate=parser.learning_rate,
+                temperatures=temps,
+                use_positivity=parser.use_positivity, # Controlled by --disable-positivity
+                prior_weight=parser.prior_weight,
+            )
+        elif parser.algorithm == 'careleast_recip':
+            print(f"Careleast: Reciprocal-Space SGLD (Amplitudes/Phases directly).")
+            # Reciprocal model doesn't need grid_size or unit_cell for FFT, just for Wilson
+            model = CareleastReciprocalSpace(
+                asu_collection=dm.asu_collection,
+                likelihood=temp_model.likelihood,
+                scaling_model=temp_model.scaling_model,
+                n_particles=parser.n_particles,
+                b_factor=parser.b_factor_prior,
+                learning_rate=parser.learning_rate,
+                temperatures=temps,
+                prior_weight=parser.prior_weight,
+            )
 
         # Compile needed for fit()
-        optimizer = tfk.optimizers.SGD(
-            learning_rate=parser.learning_rate,
-            global_clipnorm=1.0 # Clips gradients to norm 1.0
-        )
+        optimizer = tfk.optimizers.Adam(learning_rate=parser.learning_rate)
         model.compile(optimizer=optimizer)
     else:
         prior = None
@@ -174,15 +187,27 @@ def run_careless(parser):
         jit_compile=parser.jit_compile,
     )
 
-    if parser.algorithm == 'careleast':
-        # --- CARELEAST RESULT EXTRACTION ---
-        print("Extracting phases from coldest chain...")
-        final_density = model.density[0] # Coldest chain (Index 0)
+    if parser.algorithm.startswith('careleast'):
+        if parser.algorithm == 'careleast_real':
+            # --- CARELEAST RESULT EXTRACTION ---
+            print("Extracting phases from coldest chain...")
+            final_density = model.density[0] # Coldest chain (Index 0)
 
-        # Forward FFT to getting Complex F on P1 grid
-        F_grid = model._fft_forward(final_density[None, ...])[0]
-        F_grid_np = F_grid.numpy()
-        nx, ny, nz = model.grid_size
+            # Forward FFT to getting Complex F on P1 grid
+            F_grid = model._fft_forward(final_density[None, ...])[0]
+            F_grid_np = F_grid.numpy()
+            nx, ny, nz = model.grid_size
+
+        elif parser.algorithm == 'careleast_recip':
+            # Direct Extraction logic
+            F_complex = model._get_complex_F()[0] # Coldest chain
+            # F_complex is already aligned with asu_collection.reciprocal_asus[0]
+            # Note: CareleastReciprocalSpace stores F for the *concatenated* ASU table? 
+            # Or the first one?
+            # Implementation above assumed self.n_hkl = len(asu[0]).
+            # We need to slice it if there are multiple ASUs, or assume single ASU.
+            # Assuming single ASU for simplicity or map appropriately.
+            F_values = F_complex.numpy()# Build Output DataSet
 
         for i, rasu in enumerate(dm.asu_collection.reciprocal_asus):
             # Get unique HKLs for this ASU
@@ -197,26 +222,25 @@ def run_careless(parser):
             # Gather complex Structure Factors
             F_values = F_grid_np[h_idx, k_idx, l_idx]
 
-            # Build Output DataSet
-            ds = rs.DataSet({
-                'H': h,
-                'K': k,
-                'L': l,
-                'F': np.abs(F_values).astype(np.float32),
-                'PHI': np.rad2deg(np.angle(F_values)).astype(np.float32),
-                'I': np.square(np.abs(F_values)).astype(np.float32),
-                # Sigmas are unknown/undefined for single-sample extraction
-                'SigF': np.zeros_like(h, dtype=np.float32),
-                'SigI': np.zeros_like(h, dtype=np.float32),
-            }, cell=rasu.cell, spacegroup=rasu.spacegroup).infer_mtz_dtypes()
+        ds = rs.DataSet({
+            'H': h,
+            'K': k,
+            'L': l,
+            'F': np.abs(F_values).astype(np.float32),
+            'PHI': np.rad2deg(np.angle(F_values)).astype(np.float32),
+            'I': np.square(np.abs(F_values)).astype(np.float32),
+            # Sigmas are unknown/undefined for single-sample extraction
+            'SigF': np.zeros_like(h, dtype=np.float32),
+            'SigI': np.zeros_like(h, dtype=np.float32),
+        }, cell=rasu.cell, spacegroup=rasu.spacegroup).infer_mtz_dtypes()
 
-            # Reformat anomalous data if necessary
-            if rasu.anomalous:
-                ds = ds.set_index(['H', 'K', 'L']).unstack_anomalous()
+        # Reformat anomalous data if necessary
+        if rasu.anomalous:
+            ds = ds.set_index(['H', 'K', 'L']).unstack_anomalous()
 
-            filename = parser.output_base + f'_{i}.mtz'
-            print(f"Writing {filename}...")
-            ds.write_mtz(filename)
+        filename = parser.output_base + f'_{i}.mtz'
+        print(f"Writing {filename}...")
+        ds.write_mtz(filename)
 
         # Also save the raw density map (MRC/CCP4 format equivalent)
         # We can dump it to a numpy file or simple map file for inspection
