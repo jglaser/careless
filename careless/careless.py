@@ -103,6 +103,8 @@ def run_careless(parser):
                 tv_weight=parser.tv_weight,
                 prior_weight=parser.prior_weight,
                 enforce_symmetry=parser.enforce_symmetry,
+                stochastic_points=parser.stochastic_points,
+                sparsity_weight=parser.sparsity_weight,
             )
 
         optimizer = tfk.optimizers.Adam(learning_rate=parser.learning_rate)

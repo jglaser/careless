@@ -16,6 +16,19 @@ args_and_kwargs = (
         "type": int,
         "default": 4,
     }),
+    (("--stochastic-points",), {
+        "help": "Number of random real-space points to sample per step for constraints (Positivity/Sparsity) in sparse mode. "
+                "Higher values improve constraint quality but slow down training. "
+                "Set to 0 to disable. Default: 4096",
+        "type": int,
+        "default": 4096,
+    }),
+    (("--sparsity-weight",), {
+        "help": "Weight for L1 sparsity prior (|rho|) on stochastic points. Promotes atomicity/phase extension. "
+                "Default: 0.0",
+        "type": float,
+        "default": 0.0,
+    }),
     (("--b-factor-prior",), {
         "help": "The Wilson B-factor for spectral preconditioning. Default: 20.0",
         "type": float,
