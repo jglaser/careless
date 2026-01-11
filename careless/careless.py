@@ -89,12 +89,64 @@ def run_careless(parser):
             )
         elif parser.algorithm == 'careleast_spectral':
             print(f"Careleast: Spectral SGLD (Fourier Coeffs + Real Constraints).")
+            
+            initial_F_grid = None
+            if hasattr(parser, 'initial_mtz') and parser.initial_mtz:
+                print(f"Loading initialization from {parser.initial_mtz}...")
+                import reciprocalspaceship as rs
+                
+                # --- FIX: Add .reset_index() here ---
+                ds_init = rs.read_mtz(parser.initial_mtz).reset_index()
+                
+                # Now these accessors will work correctly
+                h, k, l = ds_init.H.to_numpy(), ds_init.K.to_numpy(), ds_init.L.to_numpy()
+                
+                # (The rest of the logic remains the same)
+                if 'FC' in ds_init.columns:
+                    amp = ds_init['FC'].to_numpy()
+                    phi = np.deg2rad(ds_init['PHIFC'].to_numpy())
+                else: 
+                    amp = ds_init['F'].to_numpy()
+                    phi = np.deg2rad(ds_init['PHI'].to_numpy())
+                    
+                F_complex = amp * np.exp(1j * phi)
+                
+                # Create Blank Grid (nx, ny, nz_half)
+                initial_F_grid = np.random.normal(0, 1e-6, (nx, ny, nz // 2 + 1)).astype(np.complex64)
+                initial_F_grid = initial_F_grid + 1j * np.random.normal(0, 1e-6, (nx, ny, nz // 2 + 1))
+                
+                # 1. Handle Positive L
+                mask_pos = l >= 0
+                h_pos, k_pos, l_pos = h[mask_pos], k[mask_pos], l[mask_pos]
+                F_pos = F_complex[mask_pos]
+                
+                idx_h = np.mod(h_pos, nx)
+                idx_k = np.mod(k_pos, ny)
+                idx_l = l_pos 
+                
+                valid = idx_l < (nz // 2 + 1)
+                initial_F_grid[idx_h[valid], idx_k[valid], idx_l[valid]] = F_pos[valid]
+                
+                # 2. Handle Negative L (Friedel Mates)
+                mask_neg = l < 0
+                h_neg, k_neg, l_neg = h[mask_neg], k[mask_neg], l[mask_neg]
+                F_neg = F_complex[mask_neg]
+                
+                idx_h_f = np.mod(-h_neg, nx)
+                idx_k_f = np.mod(-k_neg, ny)
+                idx_l_f = -l_neg
+                
+                F_neg_conj = np.conj(F_neg)
+                
+                valid_f = idx_l_f < (nz // 2 + 1)
+                initial_F_grid[idx_h_f[valid_f], idx_k_f[valid_f], idx_l_f[valid_f]] = F_neg_conj[valid_f]
+
             model = CareleastSpectral(
                 asu_collection=dm.asu_collection,
                 likelihood=temp_model.likelihood,
                 scaling_model=temp_model.scaling_model,
-                grid_size=grid_size, # Passed for FFT
-                unit_cell=uc,       # Passed for Wilson
+                grid_size=grid_size,
+                unit_cell=uc,
                 n_particles=parser.n_particles,
                 b_factor=parser.b_factor_prior,
                 learning_rate=parser.learning_rate,
@@ -105,8 +157,8 @@ def run_careless(parser):
                 enforce_symmetry=parser.enforce_symmetry,
                 stochastic_points=parser.stochastic_points,
                 sparsity_weight=parser.sparsity_weight,
+                initial_F=initial_F_grid, # Pass the grid
             )
-
         optimizer = tfk.optimizers.Adam(learning_rate=parser.learning_rate)
         model.compile(optimizer=optimizer)
     else:
@@ -182,13 +234,17 @@ def run_careless(parser):
 
         elif parser.algorithm == 'careleast_spectral':
             # Spectral Model (State is flattened Half-Grid F)
-            # Expand to full dense P1 grid for visualization
-            F_full_complex = model._expand_to_full(model.F_state) # Returns (N, nx, ny, nz)
-            F_grid_complex = F_full_complex[0] # Coldest chain
+            # 1. Reshape flat state to (N_particles, nx, ny, nz_half)
+            # Note: model.F_state corresponds to the output of rfft3d
+            F_half_grid = tf.reshape(model.F_state, (model.n_particles, *model.grid_size[:-1], model.nz_half))
 
-            # IFFT to get Density for MRC
-            final_density = tf.math.real(tf.signal.ifft3d(F_grid_complex))
-            F_grid = F_grid_complex.numpy()
+            # 2. Use irfft3d to reconstruct real-space density correctly
+            # This function expects the half-grid format (nx, ny, nz/2 + 1)
+            # and handles the reconstruction of negative frequencies internally.
+            final_density = tf.signal.irfft3d(F_half_grid[0])
+
+            # 3. For the MTZ, we still need the complex F values on the half-grid
+            F_grid = F_half_grid[0].numpy()
 
         nx, ny, nz = model.grid_size
 
@@ -208,12 +264,16 @@ def run_careless(parser):
             # while _expand_to_full (careleast_spectral) is full-grid.
             # We need to handle this distinction or ensure F_grid is consistent.
 
-            if parser.algorithm == 'careleast_real':
-                # rfft3d output is half-hermitian. Need Friedel wrapping for lookup.
+            # Updated MTZ extraction for Spectral mode using half-grid
+            if parser.algorithm in ['careleast_real', 'careleast_spectral']:
+                # Both now provide half-grid F_grid (real uses rfft3d output, spectral uses state directly)
                 is_friedel = l > (nz // 2)
                 idx_h = np.where(is_friedel, (nx - h) % nx, h)
                 idx_k = np.where(is_friedel, (ny - k) % ny, k)
                 idx_l = np.where(is_friedel, (nz - l) % nz, l)
+
+                # Check bounds to ensure we don't index out of nz_half
+                # (idx_l should technically be <= nz//2 if logic is correct)
                 F_values = F_grid[idx_h, idx_k, idx_l]
                 F_values = np.where(is_friedel, np.conj(F_values), F_values)
             else:

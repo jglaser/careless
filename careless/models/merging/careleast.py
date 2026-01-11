@@ -79,7 +79,7 @@ class CareleastSpectral(CareleastBase):
     1. **Vectorized Sparse Gradients:** Process all particles in parallel.
     2. **Stochastic Real-Space Constraints:** Applies Positivity/Sparsity via random point sampling (DFT).
     """
-    def __init__(self, asu_collection, likelihood, scaling_model, grid_size, unit_cell, n_particles=4, b_factor=20.0, learning_rate=1e-3, friction=0.9, temperatures=None, use_positivity=True, tv_weight=0.0, prior_weight=0.1, enforce_symmetry=True, stochastic_points=4096, sparsity_weight=0.0):
+    def __init__(self, asu_collection, likelihood, scaling_model, grid_size, unit_cell, n_particles=4, b_factor=20.0, learning_rate=1e-3, friction=0.9, temperatures=None, use_positivity=True, tv_weight=0.0, prior_weight=0.1, enforce_symmetry=True, stochastic_points=4096, sparsity_weight=0.0, initial_F=None):
         super().__init__(asu_collection, likelihood, scaling_model, n_particles, learning_rate, friction, temperatures, prior_weight)
         
         self.grid_size = grid_size
@@ -93,16 +93,25 @@ class CareleastSpectral(CareleastBase):
         self.sparsity_weight = sparsity_weight
         
         self.wilson_sigma_grid = self._precompute_wilson_sigma_grid(unit_cell, b_factor)
-        
-        # Init
-        init_sigma = self.wilson_sigma_grid
-        init_std = tf.sqrt(init_sigma / 2.0)
-        
-        init_F_real = tf.random.normal((n_particles, self.nx, self.ny, self.nz_half)) * init_std
-        init_F_imag = tf.random.normal((n_particles, self.nx, self.ny, self.nz_half)) * init_std
-        
-        init_F_flat = tf.reshape(tf.complex(init_F_real, init_F_imag), (n_particles, self.n_grid_flat))
-        
+       
+        # --- MODIFIED INITIALIZATION ---
+        if initial_F is not None:
+            print("Careleast: Initializing state from provided grid (Simulated Phases).")
+            
+            # --- FIX: Explicitly cast to complex64 ---
+            initial_F = tf.cast(initial_F, tf.complex64)
+            
+            # initial_F is expected to be shape (nx, ny, nz_half)
+            init_F_flat_single = tf.reshape(initial_F, (self.n_grid_flat,))
+            init_F_flat = tf.tile(init_F_flat_single[None, :], [n_particles, 1])
+        else:
+            # Standard Random Initialization
+            init_sigma = self.wilson_sigma_grid
+            init_std = tf.sqrt(init_sigma / 2.0)
+            init_F_real = tf.random.normal((n_particles, self.nx, self.ny, self.nz_half)) * init_std
+            init_F_imag = tf.random.normal((n_particles, self.nx, self.ny, self.nz_half)) * init_std
+            init_F_flat = tf.reshape(tf.complex(init_F_real, init_F_imag), (n_particles, self.n_grid_flat))
+
         self.F_state = tf.Variable(init_F_flat, name='F_state', dtype=tf.complex64)
         self.momentum = tf.Variable(tf.zeros_like(self.F_state), trainable=False, name='momentum', dtype=tf.complex64)
         

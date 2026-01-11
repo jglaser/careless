@@ -66,4 +66,10 @@ args_and_kwargs = (
         "dest": "enforce_symmetry",
         "default": True,
     }),
+    (("--initial-mtz",), {
+        "help": "Path to an MTZ file (F/PHI or FC/PHIFC) to initialize the spectral weights. "
+                "Useful for validating model stability using simulated phases.",
+        "type": str,
+        "default": None,
+    }),
 )
