@@ -243,6 +243,8 @@ def run_careless(parser):
         # Prepare Gemmi Grid
         ccp4 = gemmi.Ccp4Map()
         grid_np = final_density.numpy().astype(np.float32)
+        # Gemmi requires Fortran ordering (Fastest: X)
+        grid_np = np.asfortranarray(grid_np)
         ccp4.grid = gemmi.FloatGrid(grid_np)
 
         # Set Cell & Spacegroup (P1 for the raw map)
