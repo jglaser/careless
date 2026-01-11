@@ -172,29 +172,53 @@ def run_careless(parser):
 
     if parser.algorithm.startswith('careleast'):
         print("Extracting phases from coldest chain...")
-        
+        import gemmi
+
         if parser.algorithm == 'careleast_real':
+            # Real Space Model (Density is the state)
             final_density = model.density[0]
-            # Manual forward fft for output
-            F_grid = tf.signal.rfft3d(final_density).numpy() 
+            # FFT to get Structure Factors for MTZ
+            F_grid = tf.signal.rfft3d(final_density).numpy()
+
         elif parser.algorithm == 'careleast_spectral':
-            # F_state is now (N, nx, ny, nz)
-            # Symmetrize just in case for output
-            F_grid_complex = model._symmetrize_F(model.F_state)[0]
-            F_grid = F_grid_complex.numpy()
+            # Spectral Model (State is flattened Half-Grid F)
+            # Expand to full dense P1 grid for visualization
+            F_full_complex = model._expand_to_full(model.F_state) # Returns (N, nx, ny, nz)
+            F_grid_complex = F_full_complex[0] # Coldest chain
+
+            # IFFT to get Density for MRC
             final_density = tf.math.real(tf.signal.ifft3d(F_grid_complex))
+            F_grid = F_grid_complex.numpy()
 
         nx, ny, nz = model.grid_size
 
+        # --- 1. Write MTZ Files (Unchanged) ---
         for i, rasu in enumerate(dm.asu_collection.reciprocal_asus):
             hkls = rasu.lookup_table.get_hkls().astype(np.int32)
             h, k, l = hkls.T
 
-            # Map sparse HKLs to dense grid indices (handling Friedel)
+            # Map sparse HKLs to dense grid indices
             h_idx = np.mod(h, nx)
             k_idx = np.mod(k, ny)
             l_idx = np.mod(l, nz)
-            F_values = F_grid[idx_h, idx_k, idx_l]
+
+            # Since F_grid is now the FULL grid (from _expand_to_full or rfft3d output logic),
+            # we can just look up indices directly.
+            # Note: rfft3d output (careleast_real) is half-grid,
+            # while _expand_to_full (careleast_spectral) is full-grid.
+            # We need to handle this distinction or ensure F_grid is consistent.
+
+            if parser.algorithm == 'careleast_real':
+                # rfft3d output is half-hermitian. Need Friedel wrapping for lookup.
+                is_friedel = l > (nz // 2)
+                idx_h = np.where(is_friedel, (nx - h) % nx, h)
+                idx_k = np.where(is_friedel, (ny - k) % ny, k)
+                idx_l = np.where(is_friedel, (nz - l) % nz, l)
+                F_values = F_grid[idx_h, idx_k, idx_l]
+                F_values = np.where(is_friedel, np.conj(F_values), F_values)
+            else:
+                # careleast_spectral F_grid is FULL grid (from _expand_to_full)
+                F_values = F_grid[h_idx, k_idx, l_idx]
 
             ds = rs.DataSet({
                 'H': h, 'K': k, 'L': l,
@@ -212,7 +236,25 @@ def run_careless(parser):
             print(f"Writing {filename}...")
             ds.write_mtz(filename)
 
-        np.save(parser.output_base + '_density.npy', final_density.numpy())
+        # --- 2. Write MRC Map (New) ---
+        mrc_name = parser.output_base + '_density.mrc'
+        print(f"Writing {mrc_name}...")
+
+        # Prepare Gemmi Grid
+        ccp4 = gemmi.Ccp4Map()
+        grid_np = final_density.numpy().astype(np.float32)
+        ccp4.grid = gemmi.FloatGrid(grid_np)
+
+        # Set Cell & Spacegroup (P1 for the raw map)
+        uc = dm.asu_collection.reciprocal_asus[0].cell
+        ccp4.grid.unit_cell = uc
+        ccp4.grid.spacegroup = gemmi.SpaceGroup('P1')
+
+        ccp4.update_ccp4_header()
+        ccp4.write_ccp4_map(mrc_name)
+
+        # Also save raw numpy if needed
+        np.save(parser.output_base + '_density.npy', grid_np)
     else:
         # Standard saving logic (Same as original)
         for i,ds in enumerate(dm.get_results(model.surrogate_posterior, inputs=train)):
