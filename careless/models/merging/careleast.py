@@ -248,7 +248,7 @@ class CareleastSpectral(CareleastBase):
             if self.sparse_mode:
                 sigma_sparse = self._gather_sigma_sparse()
                 F_sq_sparse = tf.square(tf.abs(F_raw))
-                wilson_energy = 0.5 * tf.reduce_mean(F_sq_sparse / sigma_sparse[None, :], axis=1)
+                wilson_energy = 0.5 * tf.reduce_mean(F_sq_sparse, axis=1)
                 prior_energy += self.prior_weight * wilson_energy
                 
                 # --- STOCHASTIC CONSTRAINTS (DFT) ---
@@ -309,6 +309,13 @@ class CareleastSpectral(CareleastBase):
         if self.sparse_mode:
             grads = tape.gradient(loss, [F_raw] + self.scaling_model.trainable_variables)
             grads_F_raw, grads_scale = grads[0], grads[1:]
+
+            # --- MODIFIED: FREEZE STRUCTURE ---
+#            print("DEBUG: Structure Frozen. Refining Scale Only.")
+#            grads = tape.gradient(loss, self.scaling_model.trainable_variables)
+#            grads_F_raw = tf.zeros_like(F_raw) # <--- Force Zero Gradient
+#            grads_scale = grads
+            # ----------------------------------
         else:
             grads = tape.gradient(loss, [self.F_state] + self.scaling_model.trainable_variables)
             grads_F_raw, grads_scale = grads[0], grads[1:]
