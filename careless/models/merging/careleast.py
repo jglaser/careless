@@ -125,6 +125,118 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     
     return grid_gather_indices, grid_phase_shifts, grid_conj_flags, n_unique
 
+def safe_complex_norm(x):
+    """
+    Computes Euclidean norm of complex tensor using only real math.
+    Workaround for broken tf.norm(complex64) on ROCm.
+    """
+    real = tf.math.real(x)
+    imag = tf.math.imag(x)
+    # Sum of squares (Real)
+    sq_sum = tf.reduce_sum(tf.square(real)) + tf.reduce_sum(tf.square(imag))
+    # Sqrt
+    return tf.sqrt(sq_sum + 1e-8)
+
+@tf.custom_gradient
+def debug_ifft_probe(x):
+    """
+    Wraps tf.signal.ifft3d with a debug probe.
+    Uses safe_complex_norm to avoid false NaNs.
+    """
+    # 1. Forward Pass
+    y = tf.signal.ifft3d(x)
+    
+    def grad(dy):
+        # 2. Backward Pass
+        
+        # [FIX] Use Safe Norm
+        dy_norm = safe_complex_norm(dy)
+        dy_max = tf.reduce_max(tf.abs(dy))
+        
+        # Check for corruption (using real/imag split)
+        dy_real = tf.math.real(dy)
+        dy_imag = tf.math.imag(dy)
+        is_bad = tf.logical_or(
+            tf.logical_or(tf.reduce_any(tf.math.is_nan(dy_real)), tf.reduce_any(tf.math.is_nan(dy_imag))),
+            tf.logical_or(tf.reduce_any(tf.math.is_inf(dy_real)), tf.reduce_any(tf.math.is_inf(dy_imag)))
+        )
+
+        # Print Incoming
+        p1 = tf.print("\n[FFT Probe] BACKWARD PASS", 
+                      "\n  [In] dy Norm:", dy_norm, 
+                      "\n  [In] dy Max: ", dy_max)
+        
+        with tf.control_dependencies([p1]):
+            # If input is bad, stop here
+            def handle_bad_input():
+                return tf.zeros_like(x)
+
+            def run_fft():
+                # Execute FFT
+                raw_fft = tf.signal.fft3d(dy)
+                
+                # [FIX] Use Safe Norm
+                res_norm = safe_complex_norm(raw_fft)
+                res_max = tf.reduce_max(tf.abs(raw_fft))
+                
+                p2 = tf.print("  [Op] FFT3D executed.",
+                              "\n  [Out] raw_fft Norm:", res_norm,
+                              "\n  [Out] raw_fft Max: ", res_max)
+                
+                with tf.control_dependencies([p2]):
+                    shape = tf.shape(x)
+                    N = tf.cast(shape[1]*shape[2]*shape[3], x.dtype)
+                    return raw_fft / N
+
+            return tf.cond(is_bad, handle_bad_input, run_fft)
+
+    return y, grad
+
+@tf.custom_gradient
+def safe_ifft3d_real(x):
+    """
+    Computes real(ifft3d(x)) * N_grid in a numerically stable way.
+
+    Forward:  rho = Real(IFFT(x)) * N
+    Backward: grad_x = FFT(grad_rho)
+
+    (The N factor from the forward pass cancels with the 1/N factor
+     from the IFFT gradient, leaving a clean 1:1 scale).
+    """
+    # 1. Get Grid Size (N)
+    shape = tf.shape(x)
+    nx, ny, nz = shape[1], shape[2], shape[3]
+    N = tf.cast(nx * ny * nz, x.dtype.real_dtype) # float32
+
+    # 2. Forward Pass
+    rho_complex = tf.signal.ifft3d(x)
+    rho_real = tf.math.real(rho_complex)
+    output = rho_real * N
+
+    def grad(dy):
+        # dy is d(Loss)/d(rho_scaled)
+        # We need d(Loss)/d(x)
+
+        # Analytic derivation:
+        # y = Real(IFFT(x)) * N
+        # <y, dy> = <Real(IFFT(x)) * N, dy>
+        #         = <IFFT(x), dy * N>  (treating dy as real part of complex)
+        #         = <x, IFFT_adjoint(dy * N)>
+
+        # TF's FFT is unnormalized. TF's IFFT is 1/N normalized.
+        # Parseval: <IFFT(x), y> = 1/N * <x, FFT(y)>
+        # So: <x, 1/N * FFT(dy * N)>
+        #     = <x, FFT(dy)>
+
+        # Result: The N's cancel out perfectly.
+
+        dy_complex = tf.complex(dy, tf.zeros_like(dy))
+        grad_x = tf.signal.fft3d(dy_complex)
+
+        return grad_x
+
+    return output, grad
+
 class CareleastBase(tfk.models.Model, BaseModel):
     """Base class for Stochastic Phasing Engines"""
     def __init__(self, asu_collection, likelihood, scaling_model, n_particles, learning_rate, friction, temperatures, prior_weight=0.1):
@@ -324,39 +436,38 @@ class CareleastSpectral(CareleastBase):
         inputs = data[0]
         batch_size = tf.cast(tf.shape(inputs[0])[0], tf.float32)
 
-        # Extract Indices
         h_in = tf.cast(inputs[0], tf.int32)
         k_in = tf.cast(inputs[1], tf.int32)
         l_in = tf.cast(inputs[2], tf.int32)
-        
         h_in = tf.reshape(h_in, [-1])
         k_in = tf.reshape(k_in, [-1])
         l_in = tf.reshape(l_in, [-1])
 
-        with tf.GradientTape() as tape:
-            # --- 1. EXPANSION (ASU -> P1) ---
-            # A. Gather Unique Parameters
+        with tf.GradientTape(persistent=True) as tape:
+            # --- 1. EXPANSION CHAIN (Step-by-Step for Debugging) ---
+            
+            # Step A: Gather
             F_gathered = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
             
-            # B. Apply Conjugation (Friedel Mates)
-            F_expanded = tf.where(
-                self.asu_conj_flags, 
-                tf.math.conj(F_gathered), 
-                F_gathered
-            )
+            # Step B: Friedel/Conjugation
+            F_expanded = tf.where(self.asu_conj_flags, tf.math.conj(F_gathered), F_gathered)
             
-            # C. Apply Phase Shifts (Symmetry Translation) & Filter Absences
+            # Step C: Phase Shift
             F_grid_flat = F_expanded * self.asu_phase_shifts
             
-            # --- 2. DENSITY ---
+            # Step D: Reshape & Expand to Full Grid
             F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
             F_full = self._expand_to_full(F_grid_half)
             
-            # [FIX 1] Density Scaling (Normalize IFFT to Electrons)
+            # Step E: IFFT to Real Space
+            # Note: We trace 'rho' specifically
+            #rho = safe_ifft3d_real(F_full)
             total_grid_points = tf.cast(self.nx * self.ny * (2 * self.nz_half - 2), tf.float32)
-            rho = tf.math.real(tf.signal.ifft3d(F_full)) * total_grid_points
+            rho_complex = debug_ifft_probe(F_full)
+            rho = tf.math.real(rho_complex) * total_grid_points
             
-            # --- 3. DYNAMIC GATHER ---
+            # --- 2. LIKELIHOOD CHAIN (Separate path) ---
+            # DYNAMIC GATHER for Data
             is_friedel = l_in < 0
             h = tf.where(is_friedel, -h_in, h_in)
             k = tf.where(is_friedel, -k_in, k_in)
@@ -368,7 +479,6 @@ class CareleastSpectral(CareleastBase):
             F_batch = tf.gather(F_grid_flat, flat_indices, axis=1)
             F_abs_sq = tf.square(tf.abs(F_batch))
             
-            # --- 4. SCALING ---
             if fix_scale_unity:
                 z_scale = tf.ones((1, tf.shape(F_abs_sq)[1]), dtype=tf.float32)
             else:
@@ -379,96 +489,125 @@ class CareleastSpectral(CareleastBase):
             ipred = z_scale * F_abs_sq
             ipred = tf.clip_by_value(ipred, 1e-12, 1e15)
 
-            # --- 5. LIKELIHOOD ---
             likelihood = self.likelihood(inputs)
             log_lik = tf.reduce_sum(likelihood.log_prob(ipred), axis=-1)
             nll = -tf.reduce_sum(log_lik)
             
-            # --- 6. PRIORS ---
+            # --- 3. PRIORS (Target of Debug) ---
             prior_dist = 0.0
             
-            # A. Sparsity (L1 Norm)
-            if self.sparsity_weight > 0:
-                rho_mean = tf.reduce_mean(tf.abs(rho), axis=0)
-                sparsity_term = tf.reduce_mean(rho_mean) 
-                prior_dist += self.sparsity_weight * sparsity_term
-                
-            # B. Positivity (X-ray)
+            # Define terms explicitly to watch them
+            sparsity_val = tf.reduce_mean(tf.abs(rho))
+            pos_val = tf.reduce_mean(tf.square(tf.nn.relu(-rho)))
+            
+            eps = 1e-6
+            dx = rho - tf.roll(rho, shift=1, axis=1)
+            dy = rho - tf.roll(rho, shift=1, axis=2)
+            dz = rho - tf.roll(rho, shift=1, axis=3)
+            tv_val = tf.reduce_mean(tf.sqrt(tf.square(dx) + tf.square(dy) + tf.square(dz) + eps))
+
+            # Accumulate
+            prior_dist += self.sparsity_weight * sparsity_val
             if self.use_positivity:
-                rho_mean_real = tf.reduce_mean(rho, axis=0)
-                pos_term = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
-                prior_dist += pos_term
+                prior_dist += 0.1 * pos_val 
+            prior_dist += self.tv_weight * tv_val
 
-            # [FIX 2] Total Variation (TV)
-            if self.tv_weight > 0.0:
-                eps = 1e-6
-                dx = rho - tf.roll(rho, shift=1, axis=1)
-                dy = rho - tf.roll(rho, shift=1, axis=2)
-                dz = rho - tf.roll(rho, shift=1, axis=3)
-                grad_mag = tf.sqrt(tf.square(dx) + tf.square(dy) + tf.square(dz) + eps)
-                tv_term = tf.reduce_mean(grad_mag)
-                prior_dist += self.tv_weight * tv_term
-
-            # [FIX 3] Batch Scaling
+            # Total Prior Energy (This is what we want to backpropagate)
             prior_energy = prior_dist * batch_size
             
             loss = nll + prior_energy
 
-        # --- 7. GRADIENTS ---
+        # --- 4. GRADIENT PROBE (Trace the chain backwards) ---
+        if tf.random.uniform(()) < 0.05: # Run 5% of the time
+            def probe(name, tensor_target):
+                # Gradient of PRIOR ONLY w.r.t tensor
+                g = tape.gradient(prior_energy, tensor_target)
+                if g is None:
+                    tf.print(f"  [BROKEN] {name} -> Gradient is None!")
+                else:
+                    n = tf.norm(g)
+                    tf.print(f"  [OK] {name} -> Norm:", n)
+
+            tf.print("\n--- GRADIENT TAPE TRACE (Reverse Order) ---")
+            # 1. Is the Prior calculation itself differentiable?
+            probe("d(Prior)/d(rho)", rho)
+           
+            # 2. Does it pass through the Real/Complex conversion?
+            probe("d(Prior)/d(rho_complex)", rho_complex)
+
+            # 3. Does it pass through IFFT?
+            probe("d(Prior)/d(F_full)", F_full)
+            
+            # 4. Does it pass through Expansion (expand_to_full)?
+            probe("d(Prior)/d(F_grid_half)", F_grid_half)
+            
+            # 5. Does it pass through Reshape/Phase Shift?
+            probe("d(Prior)/d(F_grid_flat)", F_grid_flat)
+            
+            # 6. Does it pass through Where/Conj?
+            probe("d(Prior)/d(F_expanded)", F_expanded)
+            
+            # 7. Does it pass through Gather?
+            probe("d(Prior)/d(F_gathered)", F_gathered)
+            
+            # 8. Does it reach the source?
+            probe("d(Prior)/d(F_state)", self.F_state)
+            tf.print("-------------------------------------------\n")
+
+        # --- 5. FINAL UPDATES ---
         vars_structure = [self.F_state]
         vars_scale = self.scaling_model.trainable_variables
         all_vars = vars_structure + vars_scale
 
         grads = tape.gradient(loss, all_vars)
+        del tape
 
-        # [FIX] Decompose complex gradients for clip_by_global_norm
-        # TF cannot clip complex tensors directly. We split them into Real/Imag.
-        grads_decomposed = []
+        # [FIX] Manually decompose complex grads to avoid complex64 reduction bugs
+        grads_real_parts = []
         for g in grads:
-            if g is not None and g.dtype.is_complex:
-                grads_decomposed.append(tf.math.real(g))
-                grads_decomposed.append(tf.math.imag(g))
-            elif g is not None:
-                grads_decomposed.append(g)
+            if g is not None:
+                if g.dtype.is_complex:
+                    grads_real_parts.append(tf.math.real(g))
+                    grads_real_parts.append(tf.math.imag(g))
+                else:
+                    grads_real_parts.append(g)
 
-        # Apply Clipping to the flattened real list
-        grads_clipped_flat, _ = tf.clip_by_global_norm(grads_decomposed, 10.0)
+        # [FIX] Manual Global Norm Calculation (Float32)
+        # tf.norm(complex) is broken, but tf.norm(float) works.
+        squared_sums = [tf.reduce_sum(tf.square(g)) for g in grads_real_parts]
+        global_norm = tf.sqrt(tf.reduce_sum(tf.stack(squared_sums)) + 1e-8)
+        tf.print("\n[DEBUG] Global Gradient Norm (Manual):", global_norm)
 
-        # Recompose Gradients
+        # [FIX] Manual Clipping
+        clip_norm = 10.0
+        scale = tf.minimum(1.0, clip_norm / (global_norm + 1e-8))
+
         grads_final = []
         i = 0
         for g in grads:
-            if g is not None and g.dtype.is_complex:
-                g_real = grads_clipped_flat[i]
-                g_imag = grads_clipped_flat[i+1]
-                grads_final.append(tf.complex(g_real, g_imag))
-                i += 2
-            elif g is not None:
-                grads_final.append(grads_clipped_flat[i])
-                i += 1
+            if g is not None:
+                if g.dtype.is_complex:
+                    # Apply scale to real/imag parts and recombine
+                    g_real = grads_real_parts[i] * scale
+                    g_imag = grads_real_parts[i+1] * scale
+                    grads_final.append(tf.complex(g_real, g_imag))
+                    i += 2
+                else:
+                    # Apply scale directly
+                    grads_final.append(grads_real_parts[i] * scale)
+                    i += 1
             else:
                 grads_final.append(None)
 
         self.optimizer.apply_gradients(zip(grads_final, all_vars))
 
-        # --- STATS FOR MONITORING ---
-        rho_avg = tf.reduce_mean(rho, axis=0)
-        rho_flat = tf.reshape(rho_avg, [-1])
-        mean, var = tf.nn.moments(rho_flat, axes=[0])
-        std = tf.sqrt(var + 1e-8)
-        skewness = tf.reduce_mean(tf.pow(rho_flat - mean, 3)) / tf.pow(std, 3)
-        kurtosis = tf.reduce_mean(tf.pow(rho_flat - mean, 4)) / tf.pow(std, 4)
-        max_rho = tf.reduce_max(rho_flat)
-        grad_norm = tf.norm(grads[0]) if grads[0] is not None else 0.0
-
+        rho_flat = tf.reshape(tf.reduce_mean(rho, axis=0), [-1])
         return {
             "loss": loss,
             "nll": nll,
             "prior": prior_energy,
-            "grad_norm": grad_norm,
-            "Skew": skewness,
-            "Kurt": kurtosis,
-            "Max": max_rho
+            "grad_norm": tf.norm(grads[0]) if grads[0] is not None else 0.0,
+            "Max": tf.reduce_max(rho_flat)
         }
 
     def test_step(self, data):
