@@ -69,43 +69,50 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     stride_h = ny * nz_half
     stride_k = nz_half
     stride_l = 1
-    
+
     for op in ops:
-        rot = np.array(op.rot, dtype=np.int32).reshape(3, 3)
-        trans = np.array(op.tran, dtype=np.float32)
-        
-        # h_new = h_asu * R
-        h_new = np.matmul(indices_asu, rot)
-        
-        # Phase Shift: -2pi * h_target . t
-        # This ensures rho(Rx+t) = rho(x) under TF's +2pi*i exponent convention
-        phase_arg = -2.0 * np.pi * np.matmul(h_new, trans)
+        # 1. Normalize Gemmi Operations (Divide by DEN, usually 24)
+        den = float(op.DEN)
+        rot = np.array(op.rot, dtype=np.float32).reshape(3, 3) / den
+        trans = np.array(op.tran, dtype=np.float32) / den
+
+        # 2. Calculate h_new (Target Indices)
+        # Use float math for precision, then round to nearest int
+        h_new_float = np.matmul(indices_asu.astype(np.float32), rot)
+        h_new = np.rint(h_new_float).astype(np.int32)
+
+        # 3. Calculate Phase Shift
+        # Rule: Source Indices (ASU) + Positive Sign (+2pi)
+        # matches TF's IFFT convention with conjugated inputs
+        phase_arg = 2.0 * np.pi * np.matmul(indices_asu.astype(np.float32), trans)
         phase_shifts = np.exp(1j * phase_arg).astype(np.complex64)
-        
+
+        # ... (rest of the loop: Friedel handling, etc. remains unchanged) ...
         # Friedel Mates (l < 0)
         l_vec = h_new[:, 2]
         is_lower = l_vec < 0
-        
+
         h_final = h_new.copy()
         h_final[is_lower] *= -1
-        
+
         final_shifts = phase_shifts.copy()
+        # Important: Conjugate the shift for Friedel mates too
         final_shifts[is_lower] = np.conj(final_shifts[is_lower])
-        
+
         # Map to Grid
         h = h_final[:, 0] % nx
         k = h_final[:, 1] % ny
         l = h_final[:, 2]
-        
+
         valid_mask = (l < nz_half)
-        
+
         flat_indices = (h * stride_h + k * stride_k + l).astype(np.int32)
         flat_indices = flat_indices[valid_mask]
-        
+
         current_asu_indices = np.arange(n_unique)[valid_mask]
         current_shifts = final_shifts[valid_mask]
         current_is_lower = is_lower[valid_mask]
-        
+
         grid_gather_indices[flat_indices] = current_asu_indices
         grid_phase_shifts[flat_indices] = current_shifts
         grid_conj_flags[flat_indices] = current_is_lower
@@ -413,6 +420,7 @@ class CareleastSpectral(CareleastBase):
         all_vars = vars_structure + vars_scale
         
         grads = tape.gradient(loss, all_vars)
+        grads, _ = tf.clip_by_global_norm(grads, 10.0)
         
         # Apply gradients
         self.optimizer.apply_gradients(zip(grads, all_vars))
