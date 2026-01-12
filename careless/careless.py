@@ -50,8 +50,9 @@ def run_careless(parser):
         from careless.models.merging.careleast import CareleastRealSpace, CareleastSpectral
 
         # 1. Determine Grid Size (Needed for Spectral as well now)
-        min_d = dm.asu_collection.dHKL.min() 
-        high_res = 1.0 / np.max(np.sqrt(dm.asu_collection.dHKL)) 
+        # Fix: dm.asu_collection.dHKL is in Angstroms.
+        # The highest resolution is simply the minimum d-spacing.
+        high_res = dm.asu_collection.dHKL.min()
 
         grid_spacing = high_res / (2.0 * parser.grid_oversampling)
 
