@@ -367,36 +367,33 @@ class CareleastSpectral(CareleastBase):
         return z_scale * F_abs_sq
 
     def train_step(self, data, train_structure=True, train_scale=True, fix_scale_unity=False):
-        # 1. Unpack Data
+        # 1. Unpack Data & Batch Size
         inputs = data[0]
-
-        # Get Batch Size for scaling priors
         batch_size = tf.cast(tf.shape(inputs[0])[0], tf.float32)
 
         # Extract Indices
         h_in = tf.cast(inputs[0], tf.int32)
         k_in = tf.cast(inputs[1], tf.int32)
         l_in = tf.cast(inputs[2], tf.int32)
-
+        
         h_in = tf.reshape(h_in, [-1])
         k_in = tf.reshape(k_in, [-1])
         l_in = tf.reshape(l_in, [-1])
 
         with tf.GradientTape() as tape:
-            # --- 1. EXPANSION ---
+            # --- 1. EXPANSION (ASU -> P1) ---
             F_grid_flat = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
-
-            # --- 2. DENSITY (Normalized to Electrons) ---
+            
+            # --- 2. DENSITY ---
             F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
             F_full = self._expand_to_full(F_grid_half)
-
-            # Total Grid Points (approximate volume scaling)
-            # This makes rho units roughly "Electrons per Voxel" -> Sum is total electrons
-            # nz_full is roughly 2 * (nz_half - 1)
+            
+            # [FIX 1] Density Scaling (Normalize IFFT)
+            # Scaling by total grid points restores units to "Total Electrons"
+            # (nz_half-1)*2 is the robust way to estimate Nz from half-complex freq
             total_grid_points = tf.cast(self.nx * self.ny * (2 * self.nz_half - 2), tf.float32)
-
             rho = tf.math.real(tf.signal.ifft3d(F_full)) * total_grid_points
-
+            
             # --- 3. DYNAMIC GATHER ---
             is_friedel = l_in < 0
             h = tf.where(is_friedel, -h_in, h_in)
@@ -405,10 +402,10 @@ class CareleastSpectral(CareleastBase):
             h = h % self.nx
             k = k % self.ny
             flat_indices = (h * self.ny * self.nz_half) + (k * self.nz_half) + l
-
+            
             F_batch = tf.gather(F_grid_flat, flat_indices, axis=1)
             F_abs_sq = tf.square(tf.abs(F_batch))
-
+            
             # --- 4. SCALING ---
             if fix_scale_unity:
                 z_scale = tf.ones((1, tf.shape(F_abs_sq)[1]), dtype=tf.float32)
@@ -420,77 +417,80 @@ class CareleastSpectral(CareleastBase):
             ipred = z_scale * F_abs_sq
             ipred = tf.clip_by_value(ipred, 1e-12, 1e15)
 
-            # --- 5. LIKELIHOOD (Batch Sum) ---
+            # --- 5. LIKELIHOOD ---
             likelihood = self.likelihood(inputs)
-            # Sum over reflections in batch
             log_lik = tf.reduce_sum(likelihood.log_prob(ipred), axis=-1)
-            # NLL is positive and large (~2e6)
             nll = -tf.reduce_sum(log_lik)
-
-            # --- 6. PRIORS (Mean -> Scaled by Batch) ---
+            
+            # --- 6. PRIORS ---
+            # We calculate the "Intensive" prior energy (per map) first
             prior_dist = 0.0
-
-            # Sparsity
+            
+            # A. Sparsity (L1 Norm)
             if self.sparsity_weight > 0:
                 rho_mean = tf.reduce_mean(tf.abs(rho), axis=0)
-                # This is "Mean Density per Voxel" (Intensive)
-                sparsity_term = tf.reduce_mean(rho_mean)
+                sparsity_term = tf.reduce_mean(rho_mean) 
                 prior_dist += self.sparsity_weight * sparsity_term
-
-            # Positivity
+                
+            # B. Positivity (X-ray)
             if self.use_positivity:
                 rho_mean_real = tf.reduce_mean(rho, axis=0)
                 pos_term = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
                 prior_dist += pos_term
 
-            # [CRITICAL FIX] Scale Prior by Batch Size
-            # This makes the Prior Energy comparable to the Batch Sum NLL
-            # e.g., 30 * 20,000 = 600,000 (Comparable to 2,000,000)
-            prior_energy = prior_dist * batch_size
+            # [FIX 2] Total Variation (TV) - Penalizes Voxel Artifacts
+            if self.tv_weight > 0.0:
+                eps = 1e-6
+                # Calculate finite differences (gradients)
+                dx = rho - tf.roll(rho, shift=1, axis=1)
+                dy = rho - tf.roll(rho, shift=1, axis=2)
+                dz = rho - tf.roll(rho, shift=1, axis=3)
+                
+                # Magnitude of gradient
+                grad_mag = tf.sqrt(tf.square(dx) + tf.square(dy) + tf.square(dz) + eps)
+                
+                # Average TV over the map
+                tv_term = tf.reduce_mean(grad_mag)
+                prior_dist += self.tv_weight * tv_term
 
+            # [FIX 3] Batch Scaling
+            # Scale the prior by batch_size so it competes with NLL (which is a sum over batch)
+            prior_energy = prior_dist * batch_size
+            
             loss = nll + prior_energy
 
         # --- 7. GRADIENTS ---
         vars_structure = [self.F_state]
         vars_scale = self.scaling_model.trainable_variables
         all_vars = vars_structure + vars_scale
-
+        
         grads = tape.gradient(loss, all_vars)
-        grad_structure = grads[0]
-        grads_scale = grads[1:]
-
-        if not train_structure:
-            grad_structure = tf.zeros_like(grad_structure)
-        if (not train_scale) or fix_scale_unity:
-            grads_scale = [tf.zeros_like(g) for g in grads_scale]
-
-        final_grads = [grad_structure] + grads_scale
-        self.optimizer.apply_gradients(zip(final_grads, all_vars))
-
-        rho_flat = tf.reshape(rho, [-1])
-
-        # --- CALCULATE STATISTICS ---
-        # Mean and Variance
+        
+        # Apply gradients
+        self.optimizer.apply_gradients(zip(grads, all_vars))
+        
+        # --- STATS FOR MONITORING ---
+        # Calculate stats on the mean density map (averaged over particles)
+        rho_avg = tf.reduce_mean(rho, axis=0)
+        rho_flat = tf.reshape(rho_avg, [-1])
+        
         mean, var = tf.nn.moments(rho_flat, axes=[0])
         std = tf.sqrt(var + 1e-8)
-
-        # Skewness: E[(x-mu)^3] / std^3
+        
         skewness = tf.reduce_mean(tf.pow(rho_flat - mean, 3)) / tf.pow(std, 3)
-
-        # Kurtosis: E[(x-mu)^4] / std^4
         kurtosis = tf.reduce_mean(tf.pow(rho_flat - mean, 4)) / tf.pow(std, 4)
-
-        # Monitor Max Density (to see if peaks are growing)
         max_rho = tf.reduce_max(rho_flat)
+        
+        grad_norm = tf.norm(grads[0]) if grads[0] is not None else 0.0
 
         return {
             "loss": loss,
             "nll": nll,
             "prior": prior_energy,
-            "grad_norm": tf.norm(grad_structure),
-            "Skew": skewness,     # Look for divergence from 0
-            "Kurt": kurtosis,     # Look for divergence from 3
-            "Max": max_rho        # Should grow steadily
+            "grad_norm": grad_norm,
+            "Skew": skewness,
+            "Kurt": kurtosis,
+            "Max": max_rho
         }
 
     def test_step(self, data):
