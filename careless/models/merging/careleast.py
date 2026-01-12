@@ -6,10 +6,6 @@ import gemmi
 from careless.models.base import BaseModel
 from tqdm.autonotebook import tqdm
 
-# ... (keep build_symmetry_map_gemmi and CareleastBase as they are) ...
-# Copy the build_symmetry_map_gemmi and CareleastBase classes from your uploaded file here
-# or assume they remain unchanged. I will provide the full CareleastSpectral class below.
-
 def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     """
     Builds a full symmetry expansion map (ASU -> P1 Grid).
@@ -17,16 +13,16 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     """
     print(f"Building rigorous symmetry map for {space_group_symbol}...")
     nx, ny, nz_half = grid_size
-
+    
     # 1. Setup Spacegroup and Cell
     sg = gemmi.SpaceGroup(space_group_symbol)
     ops = sg.operations()
-
-    if hasattr(unit_cell_params, 'a'):
+    
+    if hasattr(unit_cell_params, 'a'): 
         cell = unit_cell_params
     else:
         cell = gemmi.UnitCell(*unit_cell_params)
-
+    
     # 2. Generate P1 Grid Indices
     print("  Generating P1 grid indices...")
     H, K, L = np.meshgrid(
@@ -36,80 +32,80 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
         indexing='ij'
     )
     h_flat, k_flat, l_flat = H.flatten(), K.flatten(), L.flatten()
-
+    
     # Map to ASU
     ds = rs.DataSet({
         'H': h_flat, 'K': k_flat, 'L': l_flat
     }, cell=cell, spacegroup=sg)
     ds.hkl_to_asu(inplace=True)
-
+    
     # Get Unique Indices
     print("  Finding unique ASU parameters...")
     unique_hkls = ds.groupby(['H', 'K', 'L']).first().reset_index()[['H', 'K', 'L']].to_numpy(dtype=np.int32)
-
+    
     # 3. Filter Systematic Absences
     print(f"  Filtering systematic absences from {len(unique_hkls)} unique reflections...")
     keep_mask = np.ones(len(unique_hkls), dtype=bool)
-
+    
     for i in range(len(unique_hkls)):
         h, k, l = unique_hkls[i]
         # Robust absence check
         if ops.is_systematically_absent([int(h), int(k), int(l)]):
             keep_mask[i] = False
-
+            
     indices_asu = unique_hkls[keep_mask]
     n_unique = len(indices_asu)
     print(f"  Unique Reflections (non-absent): {n_unique}")
-
+    
     # 4. Prepare Grid Maps
     total_grid_points = nx * ny * nz_half
     grid_gather_indices = np.full(total_grid_points, -1, dtype=np.int32)
     grid_phase_shifts = np.zeros(total_grid_points, dtype=np.complex64)
     grid_conj_flags = np.zeros(total_grid_points, dtype=bool)
-
+    
     # 5. Iterate Symmetry Operations
     print(f"  Expanding {len(ops)} symmetry operations...")
-
+    
     stride_h = ny * nz_half
     stride_k = nz_half
     stride_l = 1
-
+    
     for op in ops:
         rot = np.array(op.rot, dtype=np.int32).reshape(3, 3)
         trans = np.array(op.tran, dtype=np.float32)
-
+        
         # h_new = h_asu * R
         h_new = np.matmul(indices_asu, rot)
-
-        # [FIX] Phase Shift: -2pi * h_target . t
+        
+        # Phase Shift: -2pi * h_target . t
         # This ensures rho(Rx+t) = rho(x) under TF's +2pi*i exponent convention
         phase_arg = -2.0 * np.pi * np.matmul(h_new, trans)
         phase_shifts = np.exp(1j * phase_arg).astype(np.complex64)
-
+        
         # Friedel Mates (l < 0)
         l_vec = h_new[:, 2]
         is_lower = l_vec < 0
-
+        
         h_final = h_new.copy()
         h_final[is_lower] *= -1
-
+        
         final_shifts = phase_shifts.copy()
         final_shifts[is_lower] = np.conj(final_shifts[is_lower])
-
+        
         # Map to Grid
         h = h_final[:, 0] % nx
         k = h_final[:, 1] % ny
         l = h_final[:, 2]
-
+        
         valid_mask = (l < nz_half)
-
+        
         flat_indices = (h * stride_h + k * stride_k + l).astype(np.int32)
         flat_indices = flat_indices[valid_mask]
-
+        
         current_asu_indices = np.arange(n_unique)[valid_mask]
         current_shifts = final_shifts[valid_mask]
         current_is_lower = is_lower[valid_mask]
-
+        
         grid_gather_indices[flat_indices] = current_asu_indices
         grid_phase_shifts[flat_indices] = current_shifts
         grid_conj_flags[flat_indices] = current_is_lower
@@ -119,7 +115,7 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     if np.sum(absent_mask) > 0:
         grid_gather_indices[absent_mask] = 0
         grid_phase_shifts[absent_mask] = 0.0 + 0.0j
-
+    
     return grid_gather_indices, grid_phase_shifts, grid_conj_flags, n_unique
 
 class CareleastBase(tfk.models.Model, BaseModel):
@@ -187,6 +183,7 @@ class CareleastBase(tfk.models.Model, BaseModel):
             bar.set_postfix(pf)
         return history
 
+
 class CareleastSpectral(CareleastBase):
     """
     Spectral SGLD using HALF-GRID representation.
@@ -206,10 +203,7 @@ class CareleastSpectral(CareleastBase):
         
         self.wilson_sigma_grid = self._precompute_wilson_sigma_grid(unit_cell, b_factor)
        
-        # 1. Build the Map
-        print(f"Building Symmetry Map for {space_group_symbol}...")
-
-        # Build the rigorous map
+        # 1. Build the Rigorous Map
         gather_ids, phase_shifts, conj_flags, n_unique = build_symmetry_map_gemmi(
             unit_cell, space_group_symbol, (self.nx, self.ny, self.nz_half)
         )
@@ -219,34 +213,24 @@ class CareleastSpectral(CareleastBase):
         self.asu_conj_flags = tf.constant(conj_flags, dtype=tf.bool)
         self.n_unique = n_unique
 
-        # 2. Initialize Unique Parameters (Not the full grid)
+        # 2. Initialize Unique Parameters
         print(f"Initializing F_state with {n_unique} unique parameters (was {self.n_grid_flat}).")
 
-        # Initialize small random noise
         init_real = tf.random.normal((self.n_particles, n_unique), stddev=0.1)
         init_imag = tf.random.normal((self.n_particles, n_unique), stddev=0.1)
         init_val = tf.complex(init_real, init_imag)
 
-        # [CRITICAL] KEEP F_state, but it is now smaller
         self.F_state = tf.Variable(init_val, name='F_state', dtype=tf.complex64)
         self.momentum = tf.Variable(tf.zeros_like(self.F_state), trainable=False, name='momentum', dtype=tf.complex64)
 
         if initial_F is not None:
-             # Logic to initialize from grid ...
-             # For now, simplistic random init is safer unless we implement rigorous reverse mapping
+             # Just random init for now to be safe, handling complex gathered init is tricky
              pass
 
         self.gather_indices, self.gather_friedel_mask = self._precompute_gather_indices()
         
-        # Sparse mode active if TV is OFF (TV requires dense grid neighbors)
-        self.sparse_mode = (self.tv_weight <= 0.0)
-        
-        if self.sparse_mode:
-            print(f"Careleast: Sparse Mode Active.")
-            if self.stochastic_points > 0 and (self.use_positivity or self.sparsity_weight > 0):
-                print(f"Careleast: Using Stochastic Constraints (N={self.stochastic_points}).")
-            else:
-                print("Careleast: No spatial constraints.")
+        # We are using Full Grid FFT (Dense mode)
+        self.sparse_mode = False 
 
     def _precompute_wilson_sigma_grid(self, unit_cell, b_factor):
         uc = unit_cell.parameters
@@ -285,19 +269,6 @@ class CareleastSpectral(CareleastBase):
         mask = self.gather_friedel_mask[None, :]
         return tf.where(mask, tf.math.conj(F_vals), F_vals)
 
-    def _reconstruct_hkl_vectors(self, flat_indices):
-        """Recover (h,k,l) from grid indices for DFT phase calculation."""
-        iz = flat_indices % self.nz_half
-        iy = (flat_indices // self.nz_half) % self.ny
-        ix = flat_indices // (self.nz_half * self.ny)
-        
-        # Handle negative frequencies for h, k
-        h = tf.where(ix < self.nx // 2, ix, ix - self.nx)
-        k = tf.where(iy < self.ny // 2, iy, iy - self.ny)
-        l = iz # RFFT l >= 0
-        
-        return tf.cast(tf.stack([h, k, l], axis=1), tf.float32)
-
     def _expand_to_full(self, F_flat_state):
         F_half = tf.reshape(F_flat_state, (self.n_particles, self.nx, self.ny, self.nz_half))
         limit = -1 if (self.nz % 2 == 0) else None
@@ -307,33 +278,32 @@ class CareleastSpectral(CareleastBase):
         redundant_part = tf.math.conj(rev_slice)
         return tf.concat([F_half, redundant_part], axis=-1)
 
+    def _nan_safe_complex(self, x):
+        real = tf.math.real(x)
+        imag = tf.math.imag(x)
+        is_finite = tf.logical_and(tf.math.is_finite(real), tf.math.is_finite(imag))
+        real = tf.where(is_finite, real, tf.zeros_like(real))
+        imag = tf.where(is_finite, imag, tf.zeros_like(imag))
+        return tf.complex(real, imag)
+    
     def _nan_safe_real(self, x):
         return tf.where(tf.math.is_finite(x), x, tf.zeros_like(x))
 
-    def _expand_state_to_grid(self):
-        """Helper to expand unique ASU params to P1 Grid with correct symmetry."""
-        # 1. Gather Unique -> Grid
-        F_expanded = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
-        
-        # 2. Apply Friedel Conjugation
-        conj_mask = self.asu_conj_flags[None, :]
-        F_expanded = tf.where(conj_mask, tf.math.conj(F_expanded), F_expanded)
-        
-        # 3. Apply Symmetry Phase Shifts
-        shifts = self.asu_phase_shifts[None, :]
-        F_expanded = F_expanded * shifts
-        
-        return F_expanded
-
     def call(self, inputs):
+        # Forward pass for evaluation
+        # Gather with Symmetry Expansion
+        F_gathered = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
+        F_expanded = tf.where(self.asu_conj_flags, tf.math.conj(F_gathered), F_gathered)
+        F_grid_flat = F_expanded * self.asu_phase_shifts
+
+        # Map to HKL
+        flat_indices = (self.gather_indices[:, 0] * self.ny * self.nz_half) + \
+                       (self.gather_indices[:, 1] * self.nz_half) + \
+                       self.gather_indices[:, 2]
+        F_vals = tf.gather(F_grid_flat, flat_indices, axis=1)
+        
         refl_id = tf.squeeze(self.get_refl_id(inputs), axis=-1)
-        
-        # [FIXED] Expand to Grid First
-        F_grid_flat = self._expand_state_to_grid()
-        
-        # Now gather from the GRID
-        F_raw, _ = self._gather_F_sparse(F_grid_flat)
-        F_obs_complex = tf.gather(self._apply_friedel(F_raw), refl_id, axis=1)
+        F_obs_complex = tf.gather(self._apply_friedel(F_vals), refl_id, axis=1)
         F_abs_sq = tf.square(tf.abs(F_obs_complex))
         
         scale_dist = self.scaling_model(inputs)
@@ -358,14 +328,24 @@ class CareleastSpectral(CareleastBase):
 
         with tf.GradientTape() as tape:
             # --- 1. EXPANSION (ASU -> P1) ---
-            # [FIXED] Use helper to apply symmetry properly
-            F_grid_flat = self._expand_state_to_grid()
+            # A. Gather Unique Parameters
+            F_gathered = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
+            
+            # B. Apply Conjugation (Friedel Mates)
+            F_expanded = tf.where(
+                self.asu_conj_flags, 
+                tf.math.conj(F_gathered), 
+                F_gathered
+            )
+            
+            # C. Apply Phase Shifts (Symmetry Translation) & Filter Absences
+            F_grid_flat = F_expanded * self.asu_phase_shifts
             
             # --- 2. DENSITY ---
             F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
             F_full = self._expand_to_full(F_grid_half)
             
-            # Density Scaling
+            # [FIX 1] Density Scaling (Normalize IFFT to Electrons)
             total_grid_points = tf.cast(self.nx * self.ny * (2 * self.nz_half - 2), tf.float32)
             rho = tf.math.real(tf.signal.ifft3d(F_full)) * total_grid_points
             
@@ -412,7 +392,7 @@ class CareleastSpectral(CareleastBase):
                 pos_term = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
                 prior_dist += pos_term
 
-            # C. Total Variation (TV)
+            # [FIX 2] Total Variation (TV)
             if self.tv_weight > 0.0:
                 eps = 1e-6
                 dx = rho - tf.roll(rho, shift=1, axis=1)
@@ -422,7 +402,9 @@ class CareleastSpectral(CareleastBase):
                 tv_term = tf.reduce_mean(grad_mag)
                 prior_dist += self.tv_weight * tv_term
 
+            # [FIX 3] Batch Scaling
             prior_energy = prior_dist * batch_size
+            
             loss = nll + prior_energy
 
         # --- 7. GRADIENTS ---
@@ -431,9 +413,11 @@ class CareleastSpectral(CareleastBase):
         all_vars = vars_structure + vars_scale
         
         grads = tape.gradient(loss, all_vars)
+        
+        # Apply gradients
         self.optimizer.apply_gradients(zip(grads, all_vars))
         
-        # --- STATS ---
+        # --- STATS FOR MONITORING ---
         rho_avg = tf.reduce_mean(rho, axis=0)
         rho_flat = tf.reshape(rho_avg, [-1])
         mean, var = tf.nn.moments(rho_flat, axes=[0])
@@ -460,8 +444,9 @@ class CareleastSpectral(CareleastBase):
         log_lik = tf.reduce_sum(likelihood.log_prob(ipred), axis=-1)
         return {"loss": -tf.reduce_mean(log_lik), "NLL": -tf.reduce_mean(log_lik)}
 
+
 class CareleastRealSpace(CareleastBase):
-    # This remains unchanged
+    # This class remains as provided in your file for reference/completeness
     def __init__(self, asu_collection, likelihood, scaling_model, grid_size, unit_cell, n_particles=4, b_factor=20.0, learning_rate=1e-3, friction=0.9, temperatures=None, use_positivity=True, tv_weight=0.0, prior_weight=0.1):
         super().__init__(asu_collection, likelihood, scaling_model, n_particles, learning_rate, friction, temperatures, prior_weight)
         self.grid_size = grid_size

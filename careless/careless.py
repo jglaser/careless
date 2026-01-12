@@ -248,18 +248,15 @@ def run_careless(parser):
         import gemmi
 
         if parser.algorithm == 'careleast_real':
-            # Real Space Model (Density is the state)
             final_density = model.density[0]
-            # FFT to get Structure Factors for MTZ
             F_grid = tf.signal.rfft3d(final_density).numpy()
 
         elif parser.algorithm == 'careleast_spectral':
-            # [FIXED] Handle ASU Expansion for Spectral Model using the correct expansion logic
+            # Handle ASU Expansion
             if hasattr(model, 'asu_to_grid_indices'):
                 print(f"Expanding {model.n_unique} unique parameters to P1 grid with symmetry...")
 
-                # --- Manually replicate the expansion logic here ---
-                # Gather
+                # Expand to Half Grid (Flat)
                 F_grid_flat = tf.gather(model.F_state, model.asu_to_grid_indices, axis=1)
 
                 # Apply Conjugation
@@ -270,16 +267,17 @@ def run_careless(parser):
                 shifts = model.asu_phase_shifts[None, :]
                 F_grid_flat = F_grid_flat * shifts
 
-                # Reshape: (Particles, Grid_Flat) -> (Particles, Nx, Ny, Nz_half)
+                # Reshape to Half Grid
                 F_half_grid = tf.reshape(F_grid_flat, (model.n_particles, *model.grid_size[:-1], model.nz_half))
             else:
-                # Standard Dense Mode
                 F_half_grid = tf.reshape(model.F_state, (model.n_particles, *model.grid_size[:-1], model.nz_half))
 
-            # 2. Use irfft3d to reconstruct real-space density correctly
-            final_density = tf.signal.irfft3d(F_half_grid[0])
+            # [FIX] Use Manual Full Grid + IFFT + Real
+            print("Reconstructing real-space density via Full-Grid IFFT...")
+            F_full = model._expand_to_full(F_half_grid)
+            final_density = tf.math.real(tf.signal.ifft3d(F_full))[0]
 
-            # 3. For the MTZ, we still need the complex F values on the half-grid
+            # Note: For MTZ output, F_half_grid is sufficient
             F_grid = F_half_grid[0].numpy()
 
         nx, ny, nz = model.grid_size
