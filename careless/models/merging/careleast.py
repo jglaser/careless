@@ -418,13 +418,39 @@ class CareleastSpectral(CareleastBase):
         vars_structure = [self.F_state]
         vars_scale = self.scaling_model.trainable_variables
         all_vars = vars_structure + vars_scale
-        
+
         grads = tape.gradient(loss, all_vars)
-        grads, _ = tf.clip_by_global_norm(grads, 10.0)
-        
-        # Apply gradients
-        self.optimizer.apply_gradients(zip(grads, all_vars))
-        
+
+        # [FIX] Decompose complex gradients for clip_by_global_norm
+        # TF cannot clip complex tensors directly. We split them into Real/Imag.
+        grads_decomposed = []
+        for g in grads:
+            if g is not None and g.dtype.is_complex:
+                grads_decomposed.append(tf.math.real(g))
+                grads_decomposed.append(tf.math.imag(g))
+            elif g is not None:
+                grads_decomposed.append(g)
+
+        # Apply Clipping to the flattened real list
+        grads_clipped_flat, _ = tf.clip_by_global_norm(grads_decomposed, 10.0)
+
+        # Recompose Gradients
+        grads_final = []
+        i = 0
+        for g in grads:
+            if g is not None and g.dtype.is_complex:
+                g_real = grads_clipped_flat[i]
+                g_imag = grads_clipped_flat[i+1]
+                grads_final.append(tf.complex(g_real, g_imag))
+                i += 2
+            elif g is not None:
+                grads_final.append(grads_clipped_flat[i])
+                i += 1
+            else:
+                grads_final.append(None)
+
+        self.optimizer.apply_gradients(zip(grads_final, all_vars))
+
         # --- STATS FOR MONITORING ---
         rho_avg = tf.reduce_mean(rho, axis=0)
         rho_flat = tf.reshape(rho_avg, [-1])
