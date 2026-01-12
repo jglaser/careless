@@ -2,57 +2,125 @@ import tensorflow as tf
 import tf_keras as tfk
 import numpy as np
 import reciprocalspaceship as rs
+import gemmi
 from careless.models.base import BaseModel
 from tqdm.autonotebook import tqdm
 
 def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     """
-    Creates a mapping from the P1 Half-Grid to Unique ASU indices using Gemmi/RS.
+    Builds a full symmetry expansion map (ASU -> P1 Grid) including Phase Shifts and Conjugation.
     """
-    print(f"Mapping P1 grid to ASU for {space_group_symbol} using Gemmi...")
+    print(f"Building rigorous symmetry map for {space_group_symbol}...")
     nx, ny, nz_half = grid_size
 
-    # 1. Generate P1 Half-Grid Indices (z varies fastest in rfft3d usually, check implementation)
-    # Tensorflow's signal.irfft3d expects the last dim to be the half-dim (nz_half)
-    # Standard Meshgrid
+    # 1. Setup Spacegroup and Cell
+    sg = gemmi.SpaceGroup(space_group_symbol)
+    ops = sg.operations()
+
+    if hasattr(unit_cell_params, 'a'):
+        cell = unit_cell_params
+    else:
+        cell = gemmi.UnitCell(*unit_cell_params)
+
+    # 2. Generate P1 Grid Indices
+    print("  Generating P1 grid indices...")
     H, K, L = np.meshgrid(
         np.fft.fftfreq(nx, 1/nx).astype(int),
         np.fft.fftfreq(ny, 1/ny).astype(int),
         np.arange(nz_half),
         indexing='ij'
     )
+    h_flat, k_flat, l_flat = H.flatten(), K.flatten(), L.flatten()
 
-    # Flatten
-    h_flat = H.flatten()
-    k_flat = K.flatten()
-    l_flat = L.flatten()
-
-    # 2. Use ReciprocalSpaceship to Map to ASU
-    # Create a minimal DataSet (efficient wrapper around Gemmi)
+    # Map to ASU using ReciprocalSpaceship
     ds = rs.DataSet({
         'H': h_flat,
         'K': k_flat,
         'L': l_flat
-    }, cell=unit_cell_params, spacegroup=space_group_symbol)
+    }, cell=cell, spacegroup=sg)
 
-    # This function uses Gemmi C++ bindings to map indices in-place (Fast)
     ds.hkl_to_asu(inplace=True)
 
-    # 3. Encode Unique Indices to Integers
-    # We need to map every row (H,K,L) to a unique integer ID [0, N_unique-1]
+    # Get Unique Indices
+    print("  Finding unique ASU parameters...")
+    unique_hkls = ds.groupby(['H', 'K', 'L']).first().reset_index()[['H', 'K', 'L']].to_numpy(dtype=np.int32)
 
-    # A generic way to hash HKLs to integers for grouping
-    # We can use pandas 'groupby' which RS inherits
-    # This assigns a unique 'ngroup' ID to each unique HKL triplet
-    # sort=False ensures we assign IDs in order of appearance (optional, but cleaner)
-    grp = ds.groupby(['H', 'K', 'L'], sort=False)
-    gather_indices = grp.ngroup().to_numpy(dtype=np.int32)
+    # 3. Filter Systematic Absences
+    print(f"  Filtering systematic absences from {len(unique_hkls)} unique reflections...")
 
-    n_unique = grp.ngroups
-    print(f"  Grid Points: {len(h_flat)}")
-    print(f"  Unique ASU Params: {n_unique} (Reduction factor: {len(h_flat)/n_unique:.1f}x)")
+    keep_mask = np.ones(len(unique_hkls), dtype=bool)
 
-    return gather_indices, n_unique
+    for i in range(len(unique_hkls)):
+        h, k, l = unique_hkls[i]
+        # [FIX] Pass list of integers instead of gemmi.Miller object
+        if ops.is_systematically_absent([int(h), int(k), int(l)]):
+            keep_mask[i] = False
+
+    indices_asu = unique_hkls[keep_mask]
+    n_unique = len(indices_asu)
+    print(f"  Unique Reflections (non-absent): {n_unique}")
+
+    # 4. Prepare Grid Maps
+    total_grid_points = nx * ny * nz_half
+    grid_gather_indices = np.full(total_grid_points, -1, dtype=np.int32)
+    grid_phase_shifts = np.zeros(total_grid_points, dtype=np.complex64)
+    grid_conj_flags = np.zeros(total_grid_points, dtype=bool)
+
+    # 5. Iterate Symmetry Operations
+    stride_h = ny * nz_half
+    stride_k = nz_half
+    stride_l = 1
+
+    print(f"  Expanding {len(ops)} symmetry operations...")
+
+    for op in ops:
+        rot = np.array(op.rot, dtype=np.int32).reshape(3, 3)
+        trans = np.array(op.tran, dtype=np.float32)
+
+        # h_new = h_asu * R
+        h_new = np.matmul(indices_asu, rot)
+
+        # Phase Shift: -2pi * h_asu . t
+        phase_arg = -2.0 * np.pi * np.matmul(indices_asu, trans)
+        phase_shifts = np.exp(1j * phase_arg).astype(np.complex64)
+
+        # Friedel Mates (l < 0)
+        l_vec = h_new[:, 2]
+        is_lower = l_vec < 0
+
+        h_final = h_new.copy()
+        h_final[is_lower] *= -1
+
+        final_shifts = phase_shifts.copy()
+        final_shifts[is_lower] = np.conj(final_shifts[is_lower])
+
+        # Map to Grid
+        h = h_final[:, 0] % nx
+        k = h_final[:, 1] % ny
+        l = h_final[:, 2]
+
+        valid_mask = (l < nz_half)
+
+        flat_indices = (h * stride_h + k * stride_k + l).astype(np.int32)
+        flat_indices = flat_indices[valid_mask]
+
+        current_asu_indices = np.arange(n_unique)[valid_mask]
+        current_shifts = final_shifts[valid_mask]
+        current_is_lower = is_lower[valid_mask]
+
+        grid_gather_indices[flat_indices] = current_asu_indices
+        grid_phase_shifts[flat_indices] = current_shifts
+        grid_conj_flags[flat_indices] = current_is_lower
+
+    # 6. Handle Absences
+    absent_mask = (grid_gather_indices == -1)
+    n_absent = np.sum(absent_mask)
+    if n_absent > 0:
+        print(f"  Systematic Absences / Unused Grid Points: {n_absent}")
+        grid_gather_indices[absent_mask] = 0
+        grid_phase_shifts[absent_mask] = 0.0 + 0.0j
+
+    return grid_gather_indices, grid_phase_shifts, grid_conj_flags, n_unique
 
 class CareleastBase(tfk.models.Model, BaseModel):
     """Base class for Stochastic Phasing Engines"""
@@ -145,9 +213,15 @@ class CareleastSpectral(CareleastBase):
        
         # 1. Build the Map
         print(f"Building Symmetry Map for {space_group_symbol}...")
-        gather_ids, n_unique = build_symmetry_map_gemmi(unit_cell, space_group_symbol, (self.nx, self.ny, self.nz_half))
+
+        # Build the rigorous map
+        gather_ids, phase_shifts, conj_flags, n_unique = build_symmetry_map_gemmi(
+            unit_cell, space_group_symbol, (self.nx, self.ny, self.nz_half)
+        )
 
         self.asu_to_grid_indices = tf.constant(gather_ids, dtype=tf.int32)
+        self.asu_phase_shifts = tf.constant(phase_shifts, dtype=tf.complex64)
+        self.asu_conj_flags = tf.constant(conj_flags, dtype=tf.bool)
         self.n_unique = n_unique
 
         # 2. Initialize Unique Parameters (Not the full grid)
@@ -312,18 +386,26 @@ class CareleastSpectral(CareleastBase):
 
         with tf.GradientTape() as tape:
             # --- 1. EXPANSION (ASU -> P1) ---
-            # Map unique ASU parameters to the Half-Sphere Grid
-            F_grid_flat = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
+            # A. Gather Unique Parameters
+            F_gathered = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
             
-            # --- 2. DENSITY (Using IFFT3D to avoid IRFFT3D Gradient Error) ---
-            # Reshape to 3D Half-Grid
+            # B. Apply Conjugation (Friedel Mates)
+            # If flag is True, use conj(F), else F
+            F_expanded = tf.where(
+                self.asu_conj_flags, 
+                tf.math.conj(F_gathered), 
+                F_gathered
+            )
+            
+            # C. Apply Phase Shifts (Symmetry Translation)
+            # This also kills Systematic Absences (shift is 0)
+            F_grid_flat = F_expanded * self.asu_phase_shifts
+            
+            # --- 2. DENSITY (Use IFFT3D) ---
             F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
-            
-            # [FIX] Use _expand_to_full + ifft3d instead of irfft3d
-            # This avoids the "gradient registry" lookup error on HPC systems
             F_full = self._expand_to_full(F_grid_half) 
-            rho = tf.math.real(tf.signal.ifft3d(F_full))
-            
+            rho = tf.math.real(tf.signal.ifft3d(F_full))           
+
             # --- 3. DYNAMIC GATHER ---
             is_friedel = l_in < 0
             h = tf.where(is_friedel, -h_in, h_in)

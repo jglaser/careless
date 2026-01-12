@@ -254,10 +254,16 @@ def run_careless(parser):
             F_grid = tf.signal.rfft3d(final_density).numpy()
 
         elif parser.algorithm == 'careleast_spectral':
-            # Spectral Model (State is flattened Half-Grid F)
-            # 1. Reshape flat state to (N_particles, nx, ny, nz_half)
-            # Note: model.F_state corresponds to the output of rfft3d
-            F_half_grid = tf.reshape(model.F_state, (model.n_particles, *model.grid_size[:-1], model.nz_half))
+            # [FIX] Handle ASU Expansion for Spectral Model
+            if hasattr(model, 'asu_to_grid_indices'):
+                print(f"Expanding {model.n_unique} unique parameters to P1 grid...")
+                # Expand: (Particles, Unique) -> (Particles, Grid_Flat)
+                F_grid_flat = tf.gather(model.F_state, model.asu_to_grid_indices, axis=1)
+                # Reshape: (Particles, Grid_Flat) -> (Particles, Nx, Ny, Nz_half)
+                F_half_grid = tf.reshape(F_grid_flat, (model.n_particles, *model.grid_size[:-1], model.nz_half))
+            else:
+                # Standard Dense Mode
+                F_half_grid = tf.reshape(model.F_state, (model.n_particles, *model.grid_size[:-1], model.nz_half))
 
             # 2. Use irfft3d to reconstruct real-space density correctly
             # This function expects the half-grid format (nx, ny, nz/2 + 1)
