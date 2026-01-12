@@ -467,11 +467,30 @@ class CareleastSpectral(CareleastBase):
         final_grads = [grad_structure] + grads_scale
         self.optimizer.apply_gradients(zip(final_grads, all_vars))
 
+        rho_flat = tf.reshape(rho, [-1])
+
+        # --- CALCULATE STATISTICS ---
+        # Mean and Variance
+        mean, var = tf.nn.moments(rho_flat, axes=[0])
+        std = tf.sqrt(var + 1e-8)
+
+        # Skewness: E[(x-mu)^3] / std^3
+        skewness = tf.reduce_mean(tf.pow(rho_flat - mean, 3)) / tf.pow(std, 3)
+
+        # Kurtosis: E[(x-mu)^4] / std^4
+        kurtosis = tf.reduce_mean(tf.pow(rho_flat - mean, 4)) / tf.pow(std, 4)
+
+        # Monitor Max Density (to see if peaks are growing)
+        max_rho = tf.reduce_max(rho_flat)
+
         return {
             "loss": loss,
             "nll": nll,
             "prior": prior_energy,
-            "grad_norm": tf.norm(grad_structure)
+            "grad_norm": tf.norm(grad_structure),
+            "Skew": skewness,     # Look for divergence from 0
+            "Kurt": kurtosis,     # Look for divergence from 3
+            "Max": max_rho        # Should grow steadily
         }
 
     def test_step(self, data):
