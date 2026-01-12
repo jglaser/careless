@@ -8,7 +8,8 @@ from tqdm.autonotebook import tqdm
 
 def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     """
-    Builds a full symmetry expansion map (ASU -> P1 Grid) including Phase Shifts and Conjugation.
+    Builds a full symmetry expansion map (ASU -> P1 Grid).
+    Uses Target Index (h_new) and Negative Phase Shift (-2pi) for correct density reconstruction.
     """
     print(f"Building rigorous symmetry map for {space_group_symbol}...")
     nx, ny, nz_half = grid_size
@@ -32,13 +33,10 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     )
     h_flat, k_flat, l_flat = H.flatten(), K.flatten(), L.flatten()
 
-    # Map to ASU using ReciprocalSpaceship
+    # Map to ASU
     ds = rs.DataSet({
-        'H': h_flat,
-        'K': k_flat,
-        'L': l_flat
+        'H': h_flat, 'K': k_flat, 'L': l_flat
     }, cell=cell, spacegroup=sg)
-
     ds.hkl_to_asu(inplace=True)
 
     # Get Unique Indices
@@ -47,12 +45,11 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
 
     # 3. Filter Systematic Absences
     print(f"  Filtering systematic absences from {len(unique_hkls)} unique reflections...")
-
     keep_mask = np.ones(len(unique_hkls), dtype=bool)
 
     for i in range(len(unique_hkls)):
         h, k, l = unique_hkls[i]
-        # [FIX] Pass list of integers instead of gemmi.Miller object
+        # Robust absence check
         if ops.is_systematically_absent([int(h), int(k), int(l)]):
             keep_mask[i] = False
 
@@ -67,11 +64,11 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
     grid_conj_flags = np.zeros(total_grid_points, dtype=bool)
 
     # 5. Iterate Symmetry Operations
+    print(f"  Expanding {len(ops)} symmetry operations...")
+
     stride_h = ny * nz_half
     stride_k = nz_half
     stride_l = 1
-
-    print(f"  Expanding {len(ops)} symmetry operations...")
 
     for op in ops:
         rot = np.array(op.rot, dtype=np.int32).reshape(3, 3)
@@ -80,8 +77,9 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
         # h_new = h_asu * R
         h_new = np.matmul(indices_asu, rot)
 
-        # Phase Shift: -2pi * h_asu . t
-        phase_arg = -2.0 * np.pi * np.matmul(indices_asu, trans)
+        # [FIX] Phase Shift: -2pi * h_target . t
+        # This ensures rho(Rx+t) = rho(x) under TF's +2pi*i exponent convention
+        phase_arg = -2.0 * np.pi * np.matmul(h_new, trans)
         phase_shifts = np.exp(1j * phase_arg).astype(np.complex64)
 
         # Friedel Mates (l < 0)
@@ -114,9 +112,7 @@ def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
 
     # 6. Handle Absences
     absent_mask = (grid_gather_indices == -1)
-    n_absent = np.sum(absent_mask)
-    if n_absent > 0:
-        print(f"  Systematic Absences / Unused Grid Points: {n_absent}")
+    if np.sum(absent_mask) > 0:
         grid_gather_indices[absent_mask] = 0
         grid_phase_shifts[absent_mask] = 0.0 + 0.0j
 
@@ -373,53 +369,46 @@ class CareleastSpectral(CareleastBase):
     def train_step(self, data, train_structure=True, train_scale=True, fix_scale_unity=False):
         # 1. Unpack Data
         inputs = data[0]
-        
+
+        # Get Batch Size for scaling priors
+        batch_size = tf.cast(tf.shape(inputs[0])[0], tf.float32)
+
         # Extract Indices
         h_in = tf.cast(inputs[0], tf.int32)
         k_in = tf.cast(inputs[1], tf.int32)
         l_in = tf.cast(inputs[2], tf.int32)
-        
-        # Reshape to flat vectors
+
         h_in = tf.reshape(h_in, [-1])
         k_in = tf.reshape(k_in, [-1])
         l_in = tf.reshape(l_in, [-1])
 
         with tf.GradientTape() as tape:
-            # --- 1. EXPANSION (ASU -> P1) ---
-            # A. Gather Unique Parameters
-            F_gathered = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
-            
-            # B. Apply Conjugation (Friedel Mates)
-            # If flag is True, use conj(F), else F
-            F_expanded = tf.where(
-                self.asu_conj_flags, 
-                tf.math.conj(F_gathered), 
-                F_gathered
-            )
-            
-            # C. Apply Phase Shifts (Symmetry Translation)
-            # This also kills Systematic Absences (shift is 0)
-            F_grid_flat = F_expanded * self.asu_phase_shifts
-            
-            # --- 2. DENSITY (Use IFFT3D) ---
+            # --- 1. EXPANSION ---
+            F_grid_flat = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
+
+            # --- 2. DENSITY (Normalized to Electrons) ---
             F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
-            F_full = self._expand_to_full(F_grid_half) 
-            rho = tf.math.real(tf.signal.ifft3d(F_full))           
+            F_full = self._expand_to_full(F_grid_half)
+
+            # Total Grid Points (approximate volume scaling)
+            # This makes rho units roughly "Electrons per Voxel" -> Sum is total electrons
+            # nz_full is roughly 2 * (nz_half - 1)
+            total_grid_points = tf.cast(self.nx * self.ny * (2 * self.nz_half - 2), tf.float32)
+
+            rho = tf.math.real(tf.signal.ifft3d(F_full)) * total_grid_points
 
             # --- 3. DYNAMIC GATHER ---
             is_friedel = l_in < 0
             h = tf.where(is_friedel, -h_in, h_in)
             k = tf.where(is_friedel, -k_in, k_in)
             l = tf.where(is_friedel, -l_in, l_in)
-            
             h = h % self.nx
             k = k % self.ny
             flat_indices = (h * self.ny * self.nz_half) + (k * self.nz_half) + l
-            
-            # Gather F for this batch (Particles, Batch)
+
             F_batch = tf.gather(F_grid_flat, flat_indices, axis=1)
             F_abs_sq = tf.square(tf.abs(F_batch))
-            
+
             # --- 4. SCALING ---
             if fix_scale_unity:
                 z_scale = tf.ones((1, tf.shape(F_abs_sq)[1]), dtype=tf.float32)
@@ -428,55 +417,56 @@ class CareleastSpectral(CareleastBase):
                 z_sample = z_dist.sample()
                 z_scale = tf.reshape(z_sample, (1, -1))
 
-            # ipred: (Particles, Batch)
             ipred = z_scale * F_abs_sq
             ipred = tf.clip_by_value(ipred, 1e-12, 1e15)
 
-            # --- 5. LIKELIHOOD ---
-            # [FIX] Use the signature you confirmed works (No Transpose)
+            # --- 5. LIKELIHOOD (Batch Sum) ---
             likelihood = self.likelihood(inputs)
-            
-            # Sum over Batch (axis=-1 because ipred is Particles x Batch?)
-            # Adjust axis based on actual behavior, but restoring your snippet:
+            # Sum over reflections in batch
             log_lik = tf.reduce_sum(likelihood.log_prob(ipred), axis=-1)
-            
-            # Reduce over particles if necessary (log_lik might be vector of particles)
-            nll = -tf.reduce_mean(log_lik)
-            
-            # --- 6. PRIORS ---
-            prior_energy = 0.0
-            
-            # Sparsity (Neutrons: L1 Norm)
+            # NLL is positive and large (~2e6)
+            nll = -tf.reduce_sum(log_lik)
+
+            # --- 6. PRIORS (Mean -> Scaled by Batch) ---
+            prior_dist = 0.0
+
+            # Sparsity
             if self.sparsity_weight > 0:
                 rho_mean = tf.reduce_mean(tf.abs(rho), axis=0)
-                sparsity_loss = self.sparsity_weight * tf.reduce_mean(rho_mean)
-                prior_energy += sparsity_loss
-                
-            # Positivity (X-ray only)
+                # This is "Mean Density per Voxel" (Intensive)
+                sparsity_term = tf.reduce_mean(rho_mean)
+                prior_dist += self.sparsity_weight * sparsity_term
+
+            # Positivity
             if self.use_positivity:
                 rho_mean_real = tf.reduce_mean(rho, axis=0)
-                pos_loss = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
-                prior_energy += pos_loss
-            
+                pos_term = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
+                prior_dist += pos_term
+
+            # [CRITICAL FIX] Scale Prior by Batch Size
+            # This makes the Prior Energy comparable to the Batch Sum NLL
+            # e.g., 30 * 20,000 = 600,000 (Comparable to 2,000,000)
+            prior_energy = prior_dist * batch_size
+
             loss = nll + prior_energy
 
         # --- 7. GRADIENTS ---
         vars_structure = [self.F_state]
         vars_scale = self.scaling_model.trainable_variables
         all_vars = vars_structure + vars_scale
-        
+
         grads = tape.gradient(loss, all_vars)
         grad_structure = grads[0]
         grads_scale = grads[1:]
-        
+
         if not train_structure:
             grad_structure = tf.zeros_like(grad_structure)
         if (not train_scale) or fix_scale_unity:
             grads_scale = [tf.zeros_like(g) for g in grads_scale]
-            
+
         final_grads = [grad_structure] + grads_scale
         self.optimizer.apply_gradients(zip(final_grads, all_vars))
-        
+
         return {
             "loss": loss,
             "nll": nll,
