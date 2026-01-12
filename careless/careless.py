@@ -89,7 +89,27 @@ def run_careless(parser):
             )
         elif parser.algorithm == 'careleast_spectral':
             print(f"Careleast: Spectral SGLD (Fourier Coeffs + Real Constraints).")
-            
+
+            # --- 1. Infer Space Group from Input Data ---
+            # We assume the first input file contains the correct symmetry headers.
+            # parser.reflection_files is a list of filenames passed as positional args.
+            import reciprocalspaceship as rs
+
+            ref_file = parser.reflection_files[0]
+            print(f"Inferring space group from: {ref_file}")
+            ds_in = rs.read_mtz(ref_file)
+
+            # Extract Hermann-Mauguin Symbol (e.g., "F d d 2" or "P 1")
+            # reciprocalspaceship uses Gemmi backend for .spacegroup
+            sg_symbol = ds_in.spacegroup.xhm()
+
+            # Optional: Allow CLI override if user expanded data to P1 but wants to refine Fdd2
+            if hasattr(parser, 'space_group') and parser.space_group is not None:
+                print(f"Overriding inferred space group ({sg_symbol}) with user request: {parser.space_group}")
+                sg_symbol = parser.space_group
+            else:
+                print(f"Using inferred space group: {sg_symbol}")
+
             initial_F_grid = None
             if hasattr(parser, 'initial_mtz') and parser.initial_mtz:
                 print(f"Loading initialization from {parser.initial_mtz}...")
@@ -158,6 +178,7 @@ def run_careless(parser):
                 stochastic_points=parser.stochastic_points,
                 sparsity_weight=parser.sparsity_weight,
                 initial_F=initial_F_grid, # Pass the grid
+                space_group_symbol=sg_symbol, # <--- NEW ARGUMENT
             )
         optimizer = tfk.optimizers.Adam(learning_rate=parser.learning_rate)
         model.compile(optimizer=optimizer)

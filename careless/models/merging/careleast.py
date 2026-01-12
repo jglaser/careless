@@ -5,6 +5,55 @@ import reciprocalspaceship as rs
 from careless.models.base import BaseModel
 from tqdm.autonotebook import tqdm
 
+def build_symmetry_map_gemmi(unit_cell_params, space_group_symbol, grid_size):
+    """
+    Creates a mapping from the P1 Half-Grid to Unique ASU indices using Gemmi/RS.
+    """
+    print(f"Mapping P1 grid to ASU for {space_group_symbol} using Gemmi...")
+    nx, ny, nz_half = grid_size
+
+    # 1. Generate P1 Half-Grid Indices (z varies fastest in rfft3d usually, check implementation)
+    # Tensorflow's signal.irfft3d expects the last dim to be the half-dim (nz_half)
+    # Standard Meshgrid
+    H, K, L = np.meshgrid(
+        np.fft.fftfreq(nx, 1/nx).astype(int),
+        np.fft.fftfreq(ny, 1/ny).astype(int),
+        np.arange(nz_half),
+        indexing='ij'
+    )
+
+    # Flatten
+    h_flat = H.flatten()
+    k_flat = K.flatten()
+    l_flat = L.flatten()
+
+    # 2. Use ReciprocalSpaceship to Map to ASU
+    # Create a minimal DataSet (efficient wrapper around Gemmi)
+    ds = rs.DataSet({
+        'H': h_flat,
+        'K': k_flat,
+        'L': l_flat
+    }, cell=unit_cell_params, spacegroup=space_group_symbol)
+
+    # This function uses Gemmi C++ bindings to map indices in-place (Fast)
+    ds.hkl_to_asu(inplace=True)
+
+    # 3. Encode Unique Indices to Integers
+    # We need to map every row (H,K,L) to a unique integer ID [0, N_unique-1]
+
+    # A generic way to hash HKLs to integers for grouping
+    # We can use pandas 'groupby' which RS inherits
+    # This assigns a unique 'ngroup' ID to each unique HKL triplet
+    # sort=False ensures we assign IDs in order of appearance (optional, but cleaner)
+    grp = ds.groupby(['H', 'K', 'L'], sort=False)
+    gather_indices = grp.ngroup().to_numpy(dtype=np.int32)
+
+    n_unique = grp.ngroups
+    print(f"  Grid Points: {len(h_flat)}")
+    print(f"  Unique ASU Params: {n_unique} (Reduction factor: {len(h_flat)/n_unique:.1f}x)")
+
+    return gather_indices, n_unique
+
 class CareleastBase(tfk.models.Model, BaseModel):
     """Base class for Stochastic Phasing Engines"""
     def __init__(self, asu_collection, likelihood, scaling_model, n_particles, learning_rate, friction, temperatures, prior_weight=0.1):
@@ -79,7 +128,7 @@ class CareleastSpectral(CareleastBase):
     1. **Vectorized Sparse Gradients:** Process all particles in parallel.
     2. **Stochastic Real-Space Constraints:** Applies Positivity/Sparsity via random point sampling (DFT).
     """
-    def __init__(self, asu_collection, likelihood, scaling_model, grid_size, unit_cell, n_particles=4, b_factor=20.0, learning_rate=1e-3, friction=0.9, temperatures=None, use_positivity=True, tv_weight=0.0, prior_weight=0.1, enforce_symmetry=True, stochastic_points=4096, sparsity_weight=0.0, initial_F=None):
+    def __init__(self, asu_collection, likelihood, scaling_model, grid_size, unit_cell, n_particles=4, b_factor=20.0, learning_rate=1e-3, friction=0.9, temperatures=None, use_positivity=True, tv_weight=0.0, prior_weight=0.1, enforce_symmetry=True, stochastic_points=4096, sparsity_weight=0.0, initial_F=None, space_group_symbol=None):
         super().__init__(asu_collection, likelihood, scaling_model, n_particles, learning_rate, friction, temperatures, prior_weight)
         
         self.grid_size = grid_size
@@ -94,16 +143,50 @@ class CareleastSpectral(CareleastBase):
         
         self.wilson_sigma_grid = self._precompute_wilson_sigma_grid(unit_cell, b_factor)
        
+        # 1. Build the Map
+        print(f"Building Symmetry Map for {space_group_symbol}...")
+        gather_ids, n_unique = build_symmetry_map_gemmi(unit_cell, space_group_symbol, (self.nx, self.ny, self.nz_half))
+
+        self.asu_to_grid_indices = tf.constant(gather_ids, dtype=tf.int32)
+        self.n_unique = n_unique
+
+        # 2. Initialize Unique Parameters (Not the full grid)
+        # Initialize Randomly
+        self.F_asu_real = tf.Variable(tf.random.normal((n_unique,), stddev=0.1))
+        self.F_asu_imag = tf.Variable(tf.random.normal((n_unique,), stddev=0.1))
+
+        print(f"Initializing F_state with {n_unique} unique parameters (was {self.n_grid_flat}).")
+
+        # Initialize small random noise
+        # Note: We initialize directly as complex to keep compatible with your existing optimizer
+        init_real = tf.random.normal((self.n_particles, n_unique), stddev=0.1)
+        init_imag = tf.random.normal((self.n_particles, n_unique), stddev=0.1)
+        init_val = tf.complex(init_real, init_imag)
+
+        # [CRITICAL] KEEP F_state, but it is now smaller
+        self.F_state = tf.Variable(init_val, name='F_state', dtype=tf.complex64)
+        self.momentum = tf.Variable(tf.zeros_like(self.F_state), trainable=False, name='momentum', dtype=tf.complex64)
+
         # --- MODIFIED INITIALIZATION ---
         if initial_F is not None:
-            print("Careleast: Initializing state from provided grid (Simulated Phases).")
-            
-            # --- FIX: Explicitly cast to complex64 ---
-            initial_F = tf.cast(initial_F, tf.complex64)
-            
-            # initial_F is expected to be shape (nx, ny, nz_half)
-            init_F_flat_single = tf.reshape(initial_F, (self.n_grid_flat,))
-            init_F_flat = tf.tile(init_F_flat_single[None, :], [n_particles, 1])
+             # initial_F is (nx, ny, nz_half)
+             flat_init = tf.reshape(initial_F, (-1,))
+             
+             # We need to extract just the unique values.
+             # Since 'gather_indices' maps Unique -> Grid, we can't just gather.
+             # We need the inverse or just pick the first occurrence of each unique ID.
+             
+             # Quick Hack for initialization:
+             # Since we computed gather_indices using `groupby`, the unique IDs are 0..N-1.
+             # We can find the index of the *first* occurrence of each ID in the grid.
+             
+             # Calculate unique_to_grid_map (once)
+             # This finds one representative grid index for every unique parameter
+             _, unique_reps = np.unique(gather_ids, return_index=True)
+             
+             # Extract values
+             vals = tf.gather(flat_init, unique_reps)
+             self.F_state.assign(tf.tile(vals[None, :], [self.n_particles, 1]))
         else:
             # Standard Random Initialization
             init_sigma = self.wilson_sigma_grid
@@ -112,9 +195,6 @@ class CareleastSpectral(CareleastBase):
             init_F_imag = tf.random.normal((n_particles, self.nx, self.ny, self.nz_half)) * init_std
             init_F_flat = tf.reshape(tf.complex(init_F_real, init_F_imag), (n_particles, self.n_grid_flat))
 
-        self.F_state = tf.Variable(init_F_flat, name='F_state', dtype=tf.complex64)
-        self.momentum = tf.Variable(tf.zeros_like(self.F_state), trainable=False, name='momentum', dtype=tf.complex64)
-        
         self.gather_indices, self.gather_friedel_mask = self._precompute_gather_indices()
         
         # Sparse mode active if TV is OFF (TV requires dense grid neighbors)
@@ -216,196 +296,112 @@ class CareleastSpectral(CareleastBase):
         z_scale = tf.where(tf.math.is_finite(z_scale), z_scale, tf.ones_like(z_scale))
         return z_scale * F_abs_sq
 
-    def train_step(self, data):
-        if isinstance(data, tuple): data = data[0]
+    def train_step(self, data, train_structure=True, train_scale=True, fix_scale_unity=False):
+        # 1. Unpack Data
+        inputs = data[0]
+        
+        # Extract Indices
+        h_in = tf.cast(inputs[0], tf.int32)
+        k_in = tf.cast(inputs[1], tf.int32)
+        l_in = tf.cast(inputs[2], tf.int32)
+        
+        # Reshape to flat vectors
+        h_in = tf.reshape(h_in, [-1])
+        k_in = tf.reshape(k_in, [-1])
+        l_in = tf.reshape(l_in, [-1])
 
         with tf.GradientTape() as tape:
-            if not self.sparse_mode:
-                tape.watch(self.F_state)
+            # --- 1. EXPANSION (ASU -> P1) ---
+            # Map unique ASU parameters to the Half-Sphere Grid
+            F_grid_flat = tf.gather(self.F_state, self.asu_to_grid_indices, axis=1)
             
-            # --- 1. Gather & Likelihood ---
-            F_raw, flat_indices = self._gather_F_sparse(self.F_state)
-            tape.watch(F_raw) 
-            F_sym = self._apply_friedel(F_raw)
+            # --- 2. DENSITY (Using IFFT3D to avoid IRFFT3D Gradient Error) ---
+            # Reshape to 3D Half-Grid
+            F_grid_half = tf.reshape(F_grid_flat, (self.n_particles, self.nx, self.ny, self.nz_half))
             
-            refl_id = tf.squeeze(self.get_refl_id(data), axis=-1)
-            F_obs_complex = tf.gather(F_sym, refl_id, axis=1)
-            F_abs_sq = tf.square(tf.abs(F_obs_complex))
+            # [FIX] Use _expand_to_full + ifft3d instead of irfft3d
+            # This avoids the "gradient registry" lookup error on HPC systems
+            F_full = self._expand_to_full(F_grid_half) 
+            rho = tf.math.real(tf.signal.ifft3d(F_full))
             
-            scale_dist = self.scaling_model(data)
-            z_scale = scale_dist.sample(self.n_particles)
-            if len(z_scale.shape) == 1: z_scale = tf.expand_dims(z_scale, 0)
-            z_scale = tf.where(tf.math.is_finite(z_scale), z_scale, tf.ones_like(z_scale))
+            # --- 3. DYNAMIC GATHER ---
+            is_friedel = l_in < 0
+            h = tf.where(is_friedel, -h_in, h_in)
+            k = tf.where(is_friedel, -k_in, k_in)
+            l = tf.where(is_friedel, -l_in, l_in)
             
+            h = h % self.nx
+            k = k % self.ny
+            flat_indices = (h * self.ny * self.nz_half) + (k * self.nz_half) + l
+            
+            # Gather F for this batch (Particles, Batch)
+            F_batch = tf.gather(F_grid_flat, flat_indices, axis=1)
+            F_abs_sq = tf.square(tf.abs(F_batch))
+            
+            # --- 4. SCALING ---
+            if fix_scale_unity:
+                z_scale = tf.ones((1, tf.shape(F_abs_sq)[1]), dtype=tf.float32)
+            else:
+                z_dist = self.scaling_model(inputs)
+                z_sample = z_dist.sample()
+                z_scale = tf.reshape(z_sample, (1, -1))
+
+            # ipred: (Particles, Batch)
             ipred = z_scale * F_abs_sq
             ipred = tf.clip_by_value(ipred, 1e-12, 1e15)
-            likelihood = self.likelihood(data)
+
+            # --- 5. LIKELIHOOD ---
+            # [FIX] Use the signature you confirmed works (No Transpose)
+            likelihood = self.likelihood(inputs)
+            
+            # Sum over Batch (axis=-1 because ipred is Particles x Batch?)
+            # Adjust axis based on actual behavior, but restoring your snippet:
             log_lik = tf.reduce_sum(likelihood.log_prob(ipred), axis=-1)
             
-            # --- 2. Prior & Constraints ---
+            # Reduce over particles if necessary (log_lik might be vector of particles)
+            nll = -tf.reduce_mean(log_lik)
+            
+            # --- 6. PRIORS ---
             prior_energy = 0.0
             
-            if self.sparse_mode:
-                sigma_sparse = self._gather_sigma_sparse()
-                F_sq_sparse = tf.square(tf.abs(F_raw))
-                wilson_energy = 0.5 * tf.reduce_mean(F_sq_sparse, axis=1)
-                prior_energy += self.prior_weight * wilson_energy
+            # Sparsity (Neutrons: L1 Norm)
+            if self.sparsity_weight > 0:
+                rho_mean = tf.reduce_mean(tf.abs(rho), axis=0)
+                sparsity_loss = self.sparsity_weight * tf.reduce_mean(rho_mean)
+                prior_energy += sparsity_loss
                 
-                # --- STOCHASTIC CONSTRAINTS (DFT) ---
-                if self.stochastic_points > 0 and (self.use_positivity or self.sparsity_weight > 0):
-                    # 1. Sample random fractional coordinates [0,1]
-                    # Shape: (N_pts, 3)
-                    r_frac = tf.random.uniform((self.stochastic_points, 3), dtype=tf.float32)
-                    
-                    # 2. Reconstruct HKLs
-                    # NOTE: We need HKLs for F_raw (which are unique half-grid).
-                    # But density is sum over ALL hkls (including friedel mates).
-                    # Approximate: rho(r) = 2 * Real( sum_{h_unique} F_h * exp(-2pi i h.r) )
-                    hkls = self._reconstruct_hkl_vectors(flat_indices) # (N_obs, 3)
-                    
-                    # 3. Compute Phase Shifts: theta = -2*pi * (r . h)
-                    # (N_pts, 3) @ (3, N_obs) -> (N_pts, N_obs)
-                    theta = -2.0 * np.pi * tf.matmul(r_frac, hkls, transpose_b=True)
-                    exp_theta = tf.exp(tf.complex(0.0, theta))
-                    
-                    # 4. Compute Density: Sum_h (F_h * exp_theta)
-                    # F_raw: (N_part, N_obs). Exp: (N_pts, N_obs)
-                    # Result: (N_part, N_pts)
-                    # Using Conjugate Transpose for dot product over N_obs
-                    rho_stochastic = 2.0 * tf.math.real(tf.matmul(F_raw, exp_theta, transpose_b=True))
-                    
-                    # 5. Penalties
-                    if self.use_positivity:
-                        pos_loss = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_stochastic)), axis=1)
-                        prior_energy += pos_loss
-                        
-                    if self.sparsity_weight > 0:
-                        sparsity_loss = self.sparsity_weight * tf.reduce_mean(tf.abs(rho_stochastic), axis=1)
-                        prior_energy += sparsity_loss
+            # Positivity (X-ray only)
+            if self.use_positivity:
+                rho_mean_real = tf.reduce_mean(rho, axis=0)
+                pos_loss = 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho_mean_real)))
+                prior_energy += pos_loss
+            
+            loss = nll + prior_energy
 
-            else:
-                # Dense FFT Mode
-                F_sq = tf.square(tf.abs(self.F_state))
-                wilson_energy = 0.5 * tf.reduce_mean(F_sq / tf.reshape(self.wilson_sigma_grid, (1, -1)), axis=1)
-                prior_energy += self.prior_weight * wilson_energy
-                
-                if self.use_positivity or (self.tv_weight > 0.0):
-                    F_full = self._expand_to_full(self.F_state)
-                    rho = tf.math.real(tf.signal.ifft3d(F_full))
-                    
-                    if self.use_positivity:
-                        prior_energy += 10.0 * tf.reduce_mean(tf.square(tf.nn.relu(-rho)), axis=[1,2,3])
-                    if self.tv_weight > 0.0:
-                        eps = 1e-6
-                        dx = tf.sqrt(tf.square(rho - tf.roll(rho, 1, 1)) + eps)
-                        dy = tf.sqrt(tf.square(rho - tf.roll(rho, 1, 2)) + eps)
-                        dz = tf.sqrt(tf.square(rho - tf.roll(rho, 1, 3)) + eps)
-                        prior_energy += self.tv_weight * tf.reduce_mean(dx + dy + dz, axis=[1,2,3])
-
-            loss = -tf.reduce_mean(log_lik) + tf.reduce_mean(prior_energy)
-            if tf.math.is_nan(loss): tf.print("\n[NaN DETECTED] Loss:", loss)
-
-        # --- GRADIENTS ---
-        if self.sparse_mode:
-            grads = tape.gradient(loss, [F_raw] + self.scaling_model.trainable_variables)
-            grads_F_raw, grads_scale = grads[0], grads[1:]
-
-            # --- MODIFIED: FREEZE STRUCTURE ---
-#            print("DEBUG: Structure Frozen. Refining Scale Only.")
-#            grads = tape.gradient(loss, self.scaling_model.trainable_variables)
-#            grads_F_raw = tf.zeros_like(F_raw) # <--- Force Zero Gradient
-#            grads_scale = grads
-            # ----------------------------------
-        else:
-            grads = tape.gradient(loss, [self.F_state] + self.scaling_model.trainable_variables)
-            grads_F_raw, grads_scale = grads[0], grads[1:]
+        # --- 7. GRADIENTS ---
+        vars_structure = [self.F_state]
+        vars_scale = self.scaling_model.trainable_variables
+        all_vars = vars_structure + vars_scale
         
-        safe_grads_scaling = []
-        if isinstance(grads_scale, list):
-             for g in grads_scale:
-                safe_grads_scaling.append(self._nan_safe_real(g) if g is not None else None)
-             self.optimizer.apply_gradients(zip(safe_grads_scaling, self.scaling_model.trainable_variables))
+        grads = tape.gradient(loss, all_vars)
+        grad_structure = grads[0]
+        grads_scale = grads[1:]
         
-        # --- SGLD UPDATE ---
-        raw_grad_norm = 0.0
+        if not train_structure:
+            grad_structure = tf.zeros_like(grad_structure)
+        if (not train_scale) or fix_scale_unity:
+            grads_scale = [tf.zeros_like(g) for g in grads_scale]
+            
+        final_grads = [grad_structure] + grads_scale
+        self.optimizer.apply_gradients(zip(final_grads, all_vars))
         
-        if self.sparse_mode:
-            grads_F_raw = self._nan_safe_complex(grads_F_raw)
-            sigma_sparse = self._gather_sigma_sparse()
-            
-            grid_indices = flat_indices
-            p_indices = tf.range(self.n_particles, dtype=tf.int32)
-            P_grid, G_grid = tf.meshgrid(p_indices, grid_indices, indexing='ij')
-            scatter_indices = tf.stack([tf.reshape(P_grid, (-1,)), tf.reshape(G_grid, (-1,))], axis=1)
-            
-            m_curr_2d = tf.gather(self.momentum, flat_indices, axis=1)
-            
-            m_flat = tf.reshape(m_curr_2d, (-1,))
-            g_flat = tf.reshape(grads_F_raw, (-1,))
-            
-            g_real = tf.math.real(g_flat)
-            g_imag = tf.math.imag(g_flat)
-            clipped_g, _ = tf.clip_by_global_norm([g_real, g_imag], 10.0)
-            g_curr = tf.complex(clipped_g[0], clipped_g[1])
-            
-            N_obs = tf.shape(sigma_sparse)[0]
-            sigma_tiled = tf.tile(sigma_sparse, [self.n_particles])
-            temps_tiled = tf.repeat(self.temperatures, repeats=N_obs)
-            
-            grad_step = g_curr * tf.cast(sigma_tiled, tf.complex64)
-            
-            gs_real = tf.math.real(grad_step)
-            gs_imag = tf.math.imag(grad_step)
-            clipped_gs, _ = tf.clip_by_global_norm([gs_real, gs_imag], 100.0)
-            grad_step = tf.complex(clipped_gs[0], clipped_gs[1])
-            
-            noise_scale = tf.sqrt(2.0 * self.learning_rate * (1.0 - self.friction) * temps_tiled)
-            noise_std = noise_scale * tf.sqrt(sigma_tiled)
-            
-            nr = tf.random.normal(tf.shape(gs_real))
-            ni = tf.random.normal(tf.shape(gs_imag))
-            noise = tf.complex(nr, ni) * tf.cast(noise_std, tf.complex64)
-            
-            new_mom = (m_flat * self.friction) - (self.learning_rate * grad_step) + noise
-            new_mom = self._nan_safe_complex(new_mom)
-            
-            self.momentum.scatter_nd_update(scatter_indices, new_mom)
-            self.F_state.scatter_nd_add(scatter_indices, new_mom)
-            
-            raw_grad_norm = tf.reduce_sum(tf.abs(g_curr))
-            
-        else:
-            grads_F_raw = self._nan_safe_complex(grads_F_raw)
-            grad_F_real = tf.math.real(grads_F_raw)
-            grad_F_imag = tf.math.imag(grads_F_raw)
-            raw_grad_norm = tf.linalg.global_norm([grad_F_real, grad_F_imag])
-            
-            clipped_raw, _ = tf.clip_by_global_norm([grad_F_real, grad_F_imag], 10.0)
-            grad_F = tf.complex(clipped_raw[0], clipped_raw[1])
-            
-            M = tf.reshape(self.wilson_sigma_grid, (1, -1))
-            grad_step_complex = grad_F * tf.cast(M, tf.complex64)
-            
-            gs_real = tf.math.real(grad_step_complex)
-            gs_imag = tf.math.imag(grad_step_complex)
-            clipped_parts, _ = tf.clip_by_global_norm([gs_real, gs_imag], 100.0)
-            grad_step = tf.complex(clipped_parts[0], clipped_parts[1])
-            
-            noise_scale = tf.sqrt(2.0 * self.learning_rate * (1.0 - self.friction) * self.temperatures)
-            noise_std = noise_scale[:, None] * tf.sqrt(M)
-            
-            nr = tf.random.normal(tf.shape(gs_real))
-            ni = tf.random.normal(tf.shape(gs_imag))
-            noise = tf.complex(nr, ni) * tf.cast(noise_std, tf.complex64)
-            
-            new_momentum = (self.momentum * self.friction) - (self.learning_rate * grad_step) + noise
-            new_momentum = self._nan_safe_complex(new_momentum)
-            
-            self.F_state.assign_add(new_momentum)
-            self.momentum.assign(new_momentum)
+        return {
+            "loss": loss,
+            "nll": nll,
+            "prior": prior_energy,
+            "grad_norm": tf.norm(grad_structure)
+        }
 
-        return {"loss": loss, "lik": tf.reduce_mean(log_lik), "NLL": -tf.reduce_mean(log_lik), "Grad Norm": raw_grad_norm}
-    
     def test_step(self, data):
         if isinstance(data, tuple): data = data[0]
         ipred = self(data)

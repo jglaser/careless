@@ -72,4 +72,10 @@ args_and_kwargs = (
         "type": str,
         "default": None,
     }),
+    (("--space-group",), {
+        "help": "Force specific space group symbol (e.g. 'Fdd2'). "
+                "Useful if input MTZ is expanded to P1 but you want to refine ASU parameters.",
+        "type": str,
+        "default": None,
+    }),
 )
