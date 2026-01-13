@@ -61,4 +61,20 @@ args_and_kwargs = (
             "action": "store_true",
         },
     ),
+    (
+        ("--positivity-weight",),
+        {
+            "help": "Weight for the real-space positivity constraint (ReLU penalty) applied when using complex surrogate posteriors. Default is 0.0 (inactive).",
+            "type": float,
+            "default": 0.0,
+        },
+    ),
+    (
+        ("--sparsity-weight",),
+        {
+            "help": "Weight for the real-space sparsity constraint (L1 penalty) applied when using complex surrogate posteriors. Default is 0.0 (inactive).",
+            "type": float,
+            "default": 0.1,
+        },
+    ),
 )
