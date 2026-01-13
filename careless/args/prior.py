@@ -72,7 +72,7 @@ args_and_kwargs = (
     (
         ("--sparsity-weight",),
         {
-            "help": "Weight for the real-space sparsity constraint (L1 penalty) applied when using complex surrogate posteriors. Default is 0.0 (inactive).",
+            "help": "Weight for the real-space sparsity constraint (L1 penalty) applied when using complex surrogate posteriors. Default is 0.1.",
             "type": float,
             "default": 0.1,
         },
