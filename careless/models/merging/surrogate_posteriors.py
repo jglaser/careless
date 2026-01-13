@@ -11,7 +11,7 @@ import numpy as np
 
 class SurrogatePosterior(tfk.models.Model):
     """ The base class for learnable variational distributions over structure factor amplitudes. """
-    def __init__(self, distribution, **kwargs):
+    def __init__(self, distribution=None, **kwargs):
         super().__init__(**kwargs)
         self.distribution = distribution
 
@@ -262,3 +262,142 @@ class FlowPosterior(SurrogatePosterior):
     @classmethod
     def from_loc_and_scale(cls, loc, scale, depth=2, hidden_units=16, inference_samples=100, **kwargs):
         return cls(loc, scale, depth=depth, hidden_units=hidden_units, inference_samples=inference_samples, **kwargs)
+
+class SplineNet(tf.keras.layers.Layer):
+    """
+    A helper Keras Layer that predicts spline parameters (widths, heights, or slopes).
+    """
+    def __init__(self, hidden_units, bins, kind, spline_range, name=None):
+        super().__init__(name=name)
+        self.hidden_units = hidden_units
+        self.bins = bins
+        self.kind = kind
+        self.spline_range = spline_range
+
+        self.dense1 = tf.keras.layers.Dense(hidden_units, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(hidden_units, activation='relu')
+
+        if kind == 'slopes':
+            # Predict (bins - 1) interior slopes.
+            self.dense_out = tf.keras.layers.Dense(bins - 1)
+            self.activation = tf.keras.layers.Activation('softplus')
+        else:
+            # Predict 'bins' widths/heights
+            self.dense_out = tf.keras.layers.Dense(bins)
+
+    def call(self, inputs):
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        out = self.dense_out(x)
+
+        if self.kind == 'slopes':
+            out = self.activation(out)
+            # Reshape to (Batch, 1, bins-1) for broadcasting
+            return tf.expand_dims(out, 1)
+        else:
+            # Softmax to ensure sum is 1, then scale to total range
+            probs = tf.nn.softmax(out, axis=-1)
+            return tf.expand_dims(probs * self.spline_range, 1)
+
+class ComplexCartesianFlow(SurrogatePosterior):
+    """
+    A Surrogate Posterior for Complex Structure Factors (Amplitude and Phase).
+    Models the joint distribution of Real and Imaginary components using RQS.
+    """
+    def __init__(self, loc, scale, depth=4, hidden_units=32, bins=32,
+                 range_min=-10.0, range_max=10.0, inference_samples=1,
+                 name='ComplexCartesianFlow', **kwargs):
+
+        # 1. Initialize Keras Model first (passing None for distribution)
+        super().__init__(distribution=None, name=name, **kwargs)
+
+        self.n_refls = loc.shape[0]
+        self.range_min = float(range_min)
+        self.range_max = float(range_max)
+        self.spline_range = self.range_max - self.range_min
+        self.inference_samples = inference_samples
+
+        # 2. Base Distribution: Independent Normal on Real/Imag parts
+        base_dist = tfd.MultivariateNormalDiag(
+            loc=tf.zeros(2 * self.n_refls),
+            scale_diag=tf.ones(2 * self.n_refls)
+        )
+
+        bijectors = []
+
+        # 3. Create Layers (tracked by self)
+        self.conditioners = []
+        for i in range(depth):
+            # A. Permutation
+            bijectors.append(tfb.Permute(permutation=np.random.permutation(2 * self.n_refls)))
+
+            # B. Conditioners
+            w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, name=f'w_{i}')
+            h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, name=f'h_{i}')
+            s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, name=f's_{i}')
+            self.conditioners.append((w_net, h_net, s_net))
+
+            # C. RQS Coupling
+            bijectors.append(tfb.RealNVP(
+                num_masked=self.n_refls,
+                bijector_fn=lambda x, ou, idx=i: tfb.RationalQuadraticSpline(
+                    bin_widths=self.conditioners[idx][0](x),
+                    bin_heights=self.conditioners[idx][1](x),
+                    knot_slopes=self.conditioners[idx][2](x),
+                    range_min=self.range_min
+                )
+            ))
+
+        # 4. Final Scale/Shift to Physical Space
+        physical_scale = tf.concat([scale, scale], axis=0)
+        physical_loc = tf.concat([loc, loc], axis=0)
+        bijectors.append(tfb.Shift(physical_loc)(tfb.Scale(physical_scale)))
+
+        chain = tfb.Chain(list(reversed(bijectors)))
+
+        # 5. Assign Distribution
+        self.distribution = tfd.TransformedDistribution(distribution=base_dist, bijector=chain)
+
+    @property
+    def parameters(self):
+        # Override to prevent exporting 'bijector' chain to MTZ
+        return {}
+
+    def parameter_properties(self, dtype=tf.float32, num_classes=None):
+        # Override to prevent get_results from iterating over internal props
+        return {}
+
+    def sample(self, n_samples=None):
+        if n_samples is None:
+            n_samples = self.inference_samples
+
+        flat_sample = self.distribution.sample(n_samples)
+        z = tf.reshape(flat_sample, (n_samples, self.n_refls, 2))
+        return tf.complex(z[..., 0], z[..., 1])
+
+    def log_prob(self, z_complex):
+        real = tf.math.real(z_complex)
+        imag = tf.math.imag(z_complex)
+
+        if len(z_complex.shape) == 1:
+            flat_input = tf.concat([real, imag], axis=0)
+        else:
+            flat_input = tf.reshape(tf.stack([real, imag], axis=-1), (tf.shape(z_complex)[0], -1))
+
+        return self.distribution.log_prob(flat_input)
+
+    def mean(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(z, axis=0)
+
+    def stddev(self):
+        z = self.sample(self.inference_samples)
+        return tf.math.reduce_std(tf.abs(z), axis=0)
+
+    def mean_intensity(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(tf.square(tf.abs(z)), axis=0)
+
+    def moment_4_intensity(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(tf.pow(tf.abs(z), 4), axis=0)

@@ -63,7 +63,7 @@ args_and_kwargs = (
                 "'flow' uses a Normalizing Flow to capture correlations and non-Gaussian shapes. Default: 'truncated_normal'",
         "type": str,
         "default": "truncated_normal",
-        "choices": ["truncated_normal", "flow"]
+        "choices": ["truncated_normal", "flow", "complex_flow"]
     }),
 
     (("--flow-depth",), {
@@ -82,5 +82,12 @@ args_and_kwargs = (
                 "Higher values give more precise moments but are slower and use more memory. Default: 100",
         "type": int,
         "default": 100,
+    }),
+    (("--stochastic-points",), {
+        "help": "Number of random real-space points to sample per step for constraints (Positivity/Sparsity) in sparse mode. "
+                "Higher values improve constraint quality but slow down training. "
+                "Set to 0 to disable. Default: 4096",
+        "type": int,
+        "default": 4096,
     }),
 )

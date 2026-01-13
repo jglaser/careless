@@ -80,53 +80,71 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
 
     def prediction_mean_stddev(self, inputs):
         """
-        Parameters
-        ----------
-        inputs : data
-            inputs is a data structure like [refl_id, image_id, metadata, intensity, uncertainty].
-            This can be a tf.DataSet, or a group of tensors.
-
-        Returns
-        -------
-        mean : np.array
-            A numpy array containing the mean value predicted by the model for each input.
-        stddev : np.array
-            A numpy array containing the standard deviation predicted by the model for each input.
-            This is a reasonable estimate of the uncertainty of the model about each input.
+        Compute the expected value and uncertainty of the intensities predicted by the model.
+        Correctly handles both Real (TruncatedNormal) and Complex (Flow) structure factors.
         """
         refl_id = self.get_refl_id(inputs)
-        #Let's actually return the expected value of the data under the current model
-        #This is <F**2.>
         scale_dist = self.scaling_model(inputs)
-        f2 = tf.square(self.surrogate_posterior.mean()) + tf.square(self.surrogate_posterior.stddev())
-        iexp = scale_dist.mean() * tf.gather(f2, tf.squeeze(refl_id, axis=-1), axis=-1)
-        iexp = iexp.numpy()
 
-        from scipy.stats import truncnorm
-        q = self.surrogate_posterior
-        f4 = q.moment_4(method='scipy')
+        # 1. Compute Moments of Structure Factors <|F|^2> and <|F|^4>
+        if hasattr(self.surrogate_posterior, 'mean_intensity'):
+            # --- Complex Flow Case ---
+            # Use explicit intensity methods (avoids complex casting errors)
+            f2 = self.surrogate_posterior.mean_intensity()
 
-        if tf.is_tensor(f4):
-            f4 = f4.numpy()
+            if hasattr(self.surrogate_posterior, 'moment_4_intensity'):
+                f4 = self.surrogate_posterior.moment_4_intensity()
+            else:
+                # Fallback sampling if not implemented
+                samples = self.surrogate_posterior.sample(100)
+                f4 = tf.reduce_mean(tf.pow(tf.abs(samples), 4), axis=0)
+        else:
+            # --- Standard Real Case ---
+            # <I> = <F^2> = Mean^2 + Var
+            f2 = tf.square(self.surrogate_posterior.mean()) + tf.square(self.surrogate_posterior.stddev())
 
-        s2 = np.square(scale_dist.mean().numpy()) + np.square(scale_dist.stddev().numpy())
-        # var(I) = <I^2> - <I>^2
-        # <I^2> = <F^4><Sigma^2>
-        ivar = f4[np.squeeze(refl_id)]*s2 - iexp*iexp
+            # <I^2> = <F^4>
+            f4 = self.surrogate_posterior.moment_4(method='scipy')
 
-        # We need to convolve the predictions if this is laue data
+        # Ensure we are working with Tensors
+        if not tf.is_tensor(f2): f2 = tf.convert_to_tensor(f2, dtype=tf.float32)
+        if not tf.is_tensor(f4): f4 = tf.convert_to_tensor(f4, dtype=tf.float32)
+
+        # 2. Map global F moments to observations
+        indices = tf.squeeze(refl_id, axis=-1)
+        f2_obs = tf.gather(f2, indices)
+        f4_obs = tf.gather(f4, indices)
+
+        # 3. Compute Intensity Statistics
+        # <I_pred> = <Scale> * <|F|^2>
+        iexp = scale_dist.mean() * f2_obs
+
+        # Var(I_pred) = <I_pred^2> - <I_pred>^2
+        # <I_pred^2> = <Scale^2> * <|F|^4>
+        # <Scale^2> = Var(Scale) + Mean(Scale)^2
+        scale_mean = scale_dist.mean()
+        scale_var = tf.square(scale_dist.stddev())
+        scale_2nd_moment = scale_var + tf.square(scale_mean)
+
+        i_sq_exp = scale_2nd_moment * f4_obs
+        ivar = i_sq_exp - tf.square(iexp)
+
+        # 4. Handle Laue Convolution (requires numpy usually)
         from careless.models.likelihoods.laue import LaueBase
         if isinstance(self.likelihood, LaueBase):
             likelihood = self.likelihood(inputs)
+
+            # Convert to numpy for convolution
+            iexp = iexp.numpy() if tf.is_tensor(iexp) else iexp
+            ivar = ivar.numpy() if tf.is_tensor(ivar) else ivar
+
             iexp = likelihood.convolve(iexp)
             ivar = likelihood.convolve(ivar)
-            # Ensure output is numpy if convolution returned tensors
-            if tf.is_tensor(iexp):
-                iexp = iexp.numpy()
-            if tf.is_tensor(ivar):
-                ivar = ivar.numpy()
 
-        return iexp,np.sqrt(ivar)
+            # Return numpy if convolved
+            return iexp, np.sqrt(ivar)
+
+        return iexp, tf.sqrt(ivar)
 
     def add_kl_div(self, posterior, prior, samples=None, weight=1., reduction='sum', name="KLDiv"):
         try:
@@ -282,3 +300,67 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
                     break
         return history
 
+class JointVariationalMergingModel(VariationalMergingModel):
+    """
+    Variational Model for Joint Refinement of Amplitudes and Phases.
+    Handles complex-valued surrogates and global (non-factorizable) priors.
+    """
+    def call(self, inputs):
+        """
+        Forward pass computing intensities and ELBO.
+        """
+        # 1. Sample Latent Complex Factors
+        # Shape: (mc_samples, n_refls) - Complex64
+        z_complex = self.surrogate_posterior.sample(self.mc_sample_size)
+
+        # 2. Sample Scales
+        scale_dist = self.scaling_model(inputs)
+        z_scale = scale_dist.sample(self.mc_sample_size)
+
+        # 3. Scale Prior KL (Optional)
+        if self.scale_prior is not None:
+            if self.scale_kl_weight is None:
+                self.add_kl_div(scale_dist, self.scale_prior, z_scale, weight=self.scale_kl_weight, reduction='sum', name="Σ KLDiv")
+            else:
+                self.add_kl_div(scale_dist, self.scale_prior, z_scale, weight=1., reduction='mean', name="Σ KLDiv")
+
+        # 4. Predict Intensities
+        # I = Scale * |F|^2
+        refl_id = self.get_refl_id(inputs)
+
+        # Gather complex factors for observed reflections
+        z_complex_gathered = tf.gather(z_complex, tf.squeeze(refl_id, axis=-1), axis=-1)
+
+        # Compute Intensity
+        ipred = z_scale * tf.square(tf.abs(z_complex_gathered))
+
+        # 5. Likelihood Term
+        likelihood = self.likelihood(inputs)
+        ll = likelihood.log_prob(ipred)
+
+        # Sum likelihood over observations (per sample) -> (mc_samples,)
+        ll_sum = tf.reduce_sum(ll, axis=-1)
+
+        # 6. Joint Prior Term
+        # Shape: (mc_samples,)
+        # Note: We pass the FULL z_complex to the prior (for FFT), not just gathered ones
+        log_prior = self.prior.log_prob(z_complex)
+
+        # 7. Entropy Term (Posterior Log Prob)
+        # Shape: (mc_samples,)
+        log_q = self.surrogate_posterior.log_prob(z_complex)
+
+        # 8. Compute ELBO
+        # ELBO = E_q [ log P(Data|z) + log P(z) - log q(z) ]
+        elbo = ll_sum + log_prior - log_q
+
+        # Average over MC samples
+        loss = -tf.reduce_mean(elbo)
+
+        # Metrics
+        self.add_loss(loss)
+        self.add_metric(-tf.reduce_mean(ll_sum), name="NLL")
+        self.add_metric(tf.reduce_mean(log_prior), name="LogPrior")
+        self.add_metric(tf.reduce_mean(log_q), name="Entropy")
+
+        return ipred
