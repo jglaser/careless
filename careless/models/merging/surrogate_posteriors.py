@@ -265,110 +265,112 @@ class FlowPosterior(SurrogatePosterior):
 
 class SplineNet(tf.keras.layers.Layer):
     """
-    A helper Keras Layer that predicts spline parameters (widths, heights, or slopes).
-    Enforces minimum constraints and identity initialization.
+    A helper Keras Layer that predicts spline parameters.
+    Uses 1D Convolutions (kernel_size=1) to allow shared weights across reflections
+    while predicting per-reflection spline parameters.
     """
-    def __init__(self, hidden_units, bins, kind, spline_range,
-                 min_bin_width=1e-2, min_bin_height=1e-2, min_derivative=1e-2,
+    def __init__(self, hidden_units, bins, kind, spline_range, 
+                 min_bin_width=1e-2, min_bin_height=1e-2, min_derivative=1e-2, 
                  name=None):
         super().__init__(name=name)
-        self.hidden_units = hidden_units
         self.bins = bins
         self.kind = kind
         self.spline_range = spline_range
-
+        
         # Stability Constraints
         self.min_bin_width = min_bin_width
         self.min_bin_height = min_bin_height
         self.min_derivative = min_derivative
-
-        # Standard hidden layers
-        self.dense1 = tf.keras.layers.Dense(hidden_units, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(hidden_units, activation='relu')
-
-        # --- IDENTITY INIT ---
-        # Initialize last layer to Zeros.
-        # This starts the flow as a near-identity transform (Uniform bins, constant slopes).
-        # It prevents the massive initial gradients caused by random initialization.
+        
+        # Conv1D acts as a shared Dense layer per element
+        # Input: (Batch, N_refls, 1) -> Output: (Batch, N_refls, Hidden)
+        self.conv1 = tf.keras.layers.Conv1D(hidden_units, kernel_size=1, activation='relu')
+        self.conv2 = tf.keras.layers.Conv1D(hidden_units, kernel_size=1, activation='relu')
+        
+        # Identity Initialization (Zeros)
         if kind == 'slopes':
-            # Predict (bins - 1) interior slopes
-            self.dense_out = tf.keras.layers.Dense(bins - 1, kernel_initializer='zeros', bias_initializer='zeros')
+            self.conv_out = tf.keras.layers.Conv1D(bins - 1, kernel_size=1, kernel_initializer='zeros')
             self.activation = tf.keras.layers.Activation('softplus')
         else:
-            # Predict 'bins' widths/heights
-            self.dense_out = tf.keras.layers.Dense(bins, kernel_initializer='zeros', bias_initializer='zeros')
+            self.conv_out = tf.keras.layers.Conv1D(bins, kernel_size=1, kernel_initializer='zeros')
 
     def call(self, inputs):
-        x = self.dense1(inputs)
-        x = self.dense2(x)
-        logits = self.dense_out(x)
-
+        # Inputs: (Batch, N_refls, 1)
+        # Note: RealNVP with num_masked=1 and event size 2 passes a scalar per reflection.
+        # But that scalar is in the last dimension. TFP passes (Batch, N_refls, 1).
+        
+        x = self.conv1(inputs)
+        x = self.conv2(x)
+        logits = self.conv_out(x) # Shape: (Batch, N_refls, bins)
+        
+        # Add singleton dimension for broadcasting against the masked component
+        # Expected Output: (Batch, N_refls, 1, bins) to broadcast against (Batch, N_refls, 1)
+        
         if self.kind == 'slopes':
-            # Slopes must be > 0.
-            # constraint: softplus(logits) + min_derivative
             out = self.activation(logits) + self.min_derivative
-            return tf.expand_dims(out, 1)
-
+            return tf.expand_dims(out, -2)
         elif self.kind == 'widths':
-            # Widths must sum to spline_range AND be > min_bin_width.
-            # Formula: min_w + (range - N*min_w) * softmax(logits)
             probs = tf.nn.softmax(logits, axis=-1)
-            available_range = self.spline_range - (self.bins * self.min_bin_width)
-            out = self.min_bin_width + (available_range * probs)
-            return tf.expand_dims(out, 1)
-
+            range_ = self.spline_range - (self.bins * self.min_bin_width)
+            out = self.min_bin_width + (range_ * probs)
+            return tf.expand_dims(out, -2)
         elif self.kind == 'heights':
-            # Same logic for heights
             probs = tf.nn.softmax(logits, axis=-1)
-            available_range = self.spline_range - (self.bins * self.min_bin_height)
-            out = self.min_bin_height + (available_range * probs)
-            return tf.expand_dims(out, 1)
+            range_ = self.spline_range - (self.bins * self.min_bin_height)
+            out = self.min_bin_height + (range_ * probs)
+            return tf.expand_dims(out, -2)
 
 
 class ComplexCartesianFlow(SurrogatePosterior):
     """
-    A Surrogate Posterior for Complex Structure Factors (Amplitude and Phase).
+    A Surrogate Posterior for Complex Structure Factors.
+    Learns a specific Mean/Variance per reflection (Trainable Base)
+    and shapes the tails/correlations using a Flow.
     """
-    def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16,
-                 range_min=-10.0, range_max=10.0, inference_samples=1,
+    def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16, 
+                 range_min=-10.0, range_max=10.0, inference_samples=1, 
                  name='ComplexCartesianFlow', **kwargs):
-
-        # 1. Init Super (deferring distribution assignment)
+        
+        # 1. Init Super (with None distribution to defer assignment)
         super().__init__(distribution=None, name=name, **kwargs)
-
+        
         self.n_refls = loc.shape[0]
         self.range_min = float(range_min)
         self.range_max = float(range_max)
         self.spline_range = self.range_max - self.range_min
         self.inference_samples = inference_samples
 
-        # 2. Base Distribution
+        # 2. Trainable Base Distribution
+        # Layout: (N_refls, 2). Index 0=Real, Index 1=Imag.
+        # This layout allows RealNVP to treat the last dimension (size 2) as the event.
+        
+        loc_init = tf.stack([loc, loc], axis=-1)   # (N, 2)
+        scale_init = tf.stack([scale, scale], axis=-1) # (N, 2)
+
+        self.base_loc = tf.Variable(loc_init, name='base_loc')
+        self.base_scale = tfp.util.TransformedVariable(scale_init, tfb.Softplus(), name='base_scale')
+
+        # Base dist is independent Normal per pixel
         base_dist = tfd.MultivariateNormalDiag(
-            loc=tf.zeros(2 * self.n_refls),
-            scale_diag=tf.ones(2 * self.n_refls)
+            loc=self.base_loc, 
+            scale_diag=self.base_scale
         )
 
         bijectors = []
-
-        # 3. Create Layers
         self.conditioners = []
+        
         for i in range(depth):
-            bijectors.append(tfb.Permute(permutation=np.random.permutation(2 * self.n_refls)))
-
-            # Create SplineNets with Constraints
-            w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range,
-                              min_bin_width=1e-2, name=f'w_{i}')
-            h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range,
-                              min_bin_height=1e-2, name=f'h_{i}')
-            s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range,
-                              min_derivative=1e-2, name=f's_{i}')
-
+            # A. RealNVP
+            # We use num_masked=1 to mask the first component (index 0) of the last axis.
+            # Condition on index 1.
+            
+            w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, name=f'w_{i}')
+            h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, name=f'h_{i}')
+            s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, name=f's_{i}')
             self.conditioners.append((w_net, h_net, s_net))
-
-            # RQS Coupling
-            # We removed the invalid kwargs here. Constraints are now enforced inside the nets.
+            
             bijectors.append(tfb.RealNVP(
-                num_masked=self.n_refls,
+                num_masked=1, 
                 bijector_fn=lambda x, ou, idx=i: tfb.RationalQuadraticSpline(
                     bin_widths=self.conditioners[idx][0](x),
                     bin_heights=self.conditioners[idx][1](x),
@@ -376,20 +378,19 @@ class ComplexCartesianFlow(SurrogatePosterior):
                     range_min=self.range_min
                 )
             ))
-
-        # 4. Final Scale/Shift
-        physical_scale = tf.concat([scale, scale], axis=0)
-        physical_loc = tf.concat([loc, loc], axis=0)
-        bijectors.append(tfb.Shift(physical_loc)(tfb.Scale(physical_scale)))
+            
+            # B. Permute
+            # Swap Re/Im in the last dimension so the next layer conditions on the other component.
+            bijectors.append(tfb.Permute(permutation=[1, 0]))
 
         chain = tfb.Chain(list(reversed(bijectors)))
-
-        # 5. Assign Distribution
+        
+        # 3. Assign Distribution
         self.distribution = tfd.TransformedDistribution(distribution=base_dist, bijector=chain)
 
     @property
     def parameters(self):
-        return {}
+        return {} 
 
     def parameter_properties(self, dtype=tf.float32, num_classes=None):
         return {}
@@ -397,18 +398,22 @@ class ComplexCartesianFlow(SurrogatePosterior):
     def sample(self, n_samples=None):
         if n_samples is None:
             n_samples = self.inference_samples
-        flat_sample = self.distribution.sample(n_samples)
-        z = tf.reshape(flat_sample, (n_samples, self.n_refls, 2))
+        # Sample (Batch, N, 2)
+        z = self.distribution.sample(n_samples)
         return tf.complex(z[..., 0], z[..., 1])
 
     def log_prob(self, z_complex):
+        # Input (Batch, N) Complex
         real = tf.math.real(z_complex)
         imag = tf.math.imag(z_complex)
-        if len(z_complex.shape) == 1:
-            flat_input = tf.concat([real, imag], axis=0)
-        else:
-            flat_input = tf.reshape(tf.stack([real, imag], axis=-1), (tf.shape(z_complex)[0], -1))
-        return self.distribution.log_prob(flat_input)
+        # Stack to (Batch, N, 2)
+        z_stacked = tf.stack([real, imag], axis=-1)
+        
+        # Calculate log_prob (Batch, N)
+        lp = self.distribution.log_prob(z_stacked)
+        
+        # Sum over reflections to return global log_prob (Batch,)
+        return tf.reduce_sum(lp, axis=-1)
 
     def mean(self):
         z = self.sample(self.inference_samples)
