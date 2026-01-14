@@ -320,18 +320,14 @@ class SplineNet(tf.keras.layers.Layer):
             out = self.min_bin_height + (range_ * probs)
             return tf.expand_dims(out, -2)
 
-
 class ComplexCartesianFlow(SurrogatePosterior):
     """
     A Surrogate Posterior for Complex Structure Factors.
-    Learns a specific Mean/Variance per reflection (Trainable Base)
-    and shapes the tails/correlations using a Flow.
     """
     def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16, 
                  range_min=-10.0, range_max=10.0, inference_samples=1, 
                  name='ComplexCartesianFlow', **kwargs):
         
-        # 1. Init Super (with None distribution to defer assignment)
         super().__init__(distribution=None, name=name, **kwargs)
         
         self.n_refls = loc.shape[0]
@@ -340,17 +336,27 @@ class ComplexCartesianFlow(SurrogatePosterior):
         self.spline_range = self.range_max - self.range_min
         self.inference_samples = inference_samples
 
-        # 2. Trainable Base Distribution
-        # Layout: (N_refls, 2). Index 0=Real, Index 1=Imag.
-        # This layout allows RealNVP to treat the last dimension (size 2) as the event.
+        # --- FIX: Random Phase Initialization ---
+        # Instead of starting at (0,0), we start at random positions on the Wilson ring.
+        # This prevents the model from getting stuck in the "zero phase" wedge.
         
-        loc_init = tf.stack([loc, loc], axis=-1)   # (N, 2)
-        scale_init = tf.stack([scale, scale], axis=-1) # (N, 2)
+        # 1. Sample random phases [-pi, pi]
+        random_phases = tf.random.uniform(shape=(self.n_refls,), minval=-np.pi, maxval=np.pi)
+        
+        # 2. Use the Wilson Sigma (scale) as the initial amplitude estimate.
+        #    We multiply by 0.5 to start slightly "inside" the ring, allowing the likelihood to push out.
+        r_init = scale * 0.5 
+        
+        # 3. Convert to Cartesian
+        loc_real = r_init * tf.cos(random_phases)
+        loc_imag = r_init * tf.sin(random_phases)
+        
+        loc_init = tf.stack([loc_real, loc_imag], axis=-1)   # (N, 2)
+        scale_init = tf.stack([scale, scale], axis=-1)       # (N, 2)
 
         self.base_loc = tf.Variable(loc_init, name='base_loc')
         self.base_scale = tfp.util.TransformedVariable(scale_init, tfb.Softplus(), name='base_scale')
 
-        # Base dist is independent Normal per pixel
         base_dist = tfd.MultivariateNormalDiag(
             loc=self.base_loc, 
             scale_diag=self.base_scale
@@ -361,9 +367,6 @@ class ComplexCartesianFlow(SurrogatePosterior):
         
         for i in range(depth):
             # A. RealNVP
-            # We use num_masked=1 to mask the first component (index 0) of the last axis.
-            # Condition on index 1.
-            
             w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, name=f'w_{i}')
             h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, name=f'h_{i}')
             s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, name=f's_{i}')
@@ -380,12 +383,9 @@ class ComplexCartesianFlow(SurrogatePosterior):
             ))
             
             # B. Permute
-            # Swap Re/Im in the last dimension so the next layer conditions on the other component.
             bijectors.append(tfb.Permute(permutation=[1, 0]))
 
         chain = tfb.Chain(list(reversed(bijectors)))
-        
-        # 3. Assign Distribution
         self.distribution = tfd.TransformedDistribution(distribution=base_dist, bijector=chain)
 
     @property
@@ -398,21 +398,14 @@ class ComplexCartesianFlow(SurrogatePosterior):
     def sample(self, n_samples=None):
         if n_samples is None:
             n_samples = self.inference_samples
-        # Sample (Batch, N, 2)
         z = self.distribution.sample(n_samples)
         return tf.complex(z[..., 0], z[..., 1])
 
     def log_prob(self, z_complex):
-        # Input (Batch, N) Complex
         real = tf.math.real(z_complex)
         imag = tf.math.imag(z_complex)
-        # Stack to (Batch, N, 2)
         z_stacked = tf.stack([real, imag], axis=-1)
-        
-        # Calculate log_prob (Batch, N)
         lp = self.distribution.log_prob(z_stacked)
-        
-        # Sum over reflections to return global log_prob (Batch,)
         return tf.reduce_sum(lp, axis=-1)
 
     def mean(self):
