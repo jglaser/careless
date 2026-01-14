@@ -169,26 +169,8 @@ class DataManager():
 
 
     def get_results(self, surrogate_posterior, inputs=None, output_parameters=True, max_intensity_snr=1e-5):
-        """ 
+        """
         Extract results from a surrogate_posterior.
-
-        Parameters
-        ----------
-        surrogate_posterior : tfd.Distribution
-            A tensorflow_probability distribution or similar object with `mean` and `stddev` methods
-        inputs : tuple (optional)
-            Optionally use a different object from self.inputs to compute the redundancy of reflections.
-        output_parameters : bool (optional)
-            If True, output the parameters of the surrogate distribution in addition to the 
-            moments. 
-        max_intensity_snr : float (optional)
-            The maximum value which will be assigned to I / SigI. 
-
-        Returns
-        -------
-        results : tuple
-            A tuple of rs.DataSet objects containing the results corresponding to each 
-            ReciprocalASU contained in self.asu_collection
         """
         if inputs is None:
             inputs = self.inputs
@@ -196,23 +178,42 @@ class DataManager():
         # 1. Retrieve Statistics based on Complexity Flag
         if self.is_complex:
             # --- Complex Case ---
-            # Assume surrogate_posterior.mean() returns Complex64
-            F_complex = surrogate_posterior.mean().numpy()
-            F = np.abs(F_complex)
-            PHI = np.angle(F_complex, deg=True)
-            
-            # Use specialized intensity methods if available on the flow object
+            # 1. Compute Centroid <F> (Vector Average)
+            # This vector's phase is the "Best Phase".
+            # Its magnitude includes the phase weighting (it shrinks if phase is ambiguous).
+            F_centroid_complex = surrogate_posterior.mean().numpy()
+
+            # 2. Compute Mean Amplitude <|F|>
+            # We need samples for this (E[|x|] != |E[x]|)
+            # Use a decent sample size for stable FOM
+            samples = surrogate_posterior.sample(200).numpy()
+            samples_amp = np.abs(samples)
+            mean_amp = np.mean(samples_amp, axis=0) # <|F|>
+
+            # 3. Compute FOM
+            # FOM = |<F>| / <|F|>
+            abs_centroid = np.abs(F_centroid_complex)
+            FOM = np.divide(abs_centroid, mean_amp, out=np.zeros_like(mean_amp), where=mean_amp!=0)
+            FOM = np.clip(FOM, 0.0, 1.0) # Clip for numerical safety
+
+            # 4. Set Output Columns
+            # Convention:
+            # 'F' column usually holds the Mean Amplitude <|F|> (unweighted).
+            # 'FOM' holds the weight.
+            # Phenix/CCP4 will compute map coefficients as F * FOM * exp(i*PHI)
+            F = mean_amp
+            PHI = np.angle(F_centroid_complex, deg=True)
+
+            # Intensity Statistics
             if hasattr(surrogate_posterior, 'mean_intensity'):
                 I = surrogate_posterior.mean_intensity().numpy()
             else:
-                samples = surrogate_posterior.sample(100).numpy()
-                I = np.mean(np.abs(samples)**2, axis=0)
+                I = np.mean(samples_amp**2, axis=0)
 
             if hasattr(surrogate_posterior, 'moment_4_intensity'):
                 f4 = surrogate_posterior.moment_4_intensity().numpy()
             else:
-                samples = surrogate_posterior.sample(100).numpy()
-                f4 = np.mean(np.abs(samples)**4, axis=0)
+                f4 = np.mean(samples_amp**4, axis=0)
 
             SigF = surrogate_posterior.stddev().numpy()
 
@@ -221,17 +222,14 @@ class DataManager():
             F = surrogate_posterior.mean().numpy()
             SigF = surrogate_posterior.stddev().numpy()
             I = SigF * SigF + F * F
-            
-            # <I^2> = <F^4>
+
             try:
                 f4 = surrogate_posterior.moment_4(method='scipy')
             except:
-                 # Fallback for models without explicit moment_4
                  f4 = surrogate_posterior.moment_4(n_samples=100).numpy()
 
         # 2. Compute Intensity Uncertainty
-        # var(I) = <I^2> - <I>^2 
-        #        = <F^4> - <I>^2
+        # var(I) = <I^2> - <I>^2
         ivar = np.square(I * max_intensity_snr)
         ivar = np.maximum(ivar, f4 - I * I)
         SigI = np.sqrt(ivar)
@@ -254,7 +252,7 @@ class DataManager():
         results = ()
         for i,asu in enumerate(self.asu_collection):
             idx = (asu_id == i).flatten()
-            
+
             # Prepare Data Dictionary
             data_dict = {
                 'H' : h[idx], 'K' : k[idx], 'L' : l[idx],
@@ -262,36 +260,36 @@ class DataManager():
                 'I' : I[idx], 'SigI' : SigI[idx],
                 'N' : N[idx],
             }
-            
+
             if self.is_complex:
                 data_dict['PHI'] = rs.DataSeries(PHI[idx], dtype='P')
+                data_dict['FOM'] = rs.DataSeries(FOM[idx], dtype='W') # 'W' is standard MTZ weight type
 
             output = rs.DataSet(
-                data_dict, 
-                cell=asu.cell, 
+                data_dict,
+                cell=asu.cell,
                 spacegroup=asu.spacegroup,
                 merged=True,
             ).infer_mtz_dtypes().set_index(['H', 'K', 'L'])
-            
+
             if params is not None:
                 for key in sorted(params.keys()):
                     val = params[key]
                     output[key] = rs.DataSeries(val[idx], index=output.index, dtype='R')
 
             # Remove unobserved refls
-            output = output[output.N > 0] 
+            output = output[output.N > 0]
 
             # Reformat anomalous data
             if asu.anomalous:
                 output = output.unstack_anomalous()
-                # PHENIX will expect the sf / error keys in a particular order.
                 anom_keys = [
-                    'F(+)', 'SigF(+)', 'F(-)', 'SigF(-)', 
-                    'I(+)', 'SigI(+)', 'I(-)', 'SigI(-)', 
+                    'F(+)', 'SigF(+)', 'F(-)', 'SigF(-)',
+                    'I(+)', 'SigI(+)', 'I(-)', 'SigI(-)',
                     'N(+)', 'N(-)'
                 ]
                 if self.is_complex:
-                    anom_keys += ['PHI(+)', 'PHI(-)']
+                    anom_keys += ['PHI(+)', 'PHI(-)', 'FOM(+)', 'FOM(-)']
 
                 reorder = [k for k in anom_keys if k in output] + [key for key in output if key not in anom_keys]
                 output = output[reorder]
