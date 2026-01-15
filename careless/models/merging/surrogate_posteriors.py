@@ -322,68 +322,87 @@ class SplineNet(tf.keras.layers.Layer):
 
 class ComplexCartesianFlow(SurrogatePosterior):
     """
-    A Surrogate Posterior for Complex Structure Factors.
+    A Surrogate Posterior for Complex Structure Factors using a Mixture Base.
+    Uses 4 components per reflection to topologically cover the full phase ring.
     """
-    def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16, 
-                 range_min=-10.0, range_max=10.0, inference_samples=1, 
+    def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16,
+                 range_min=-10.0, range_max=10.0, inference_samples=1,
                  name='ComplexCartesianFlow', **kwargs):
-        
+
         super().__init__(distribution=None, name=name, **kwargs)
-        
+
         self.n_refls = loc.shape[0]
         self.range_min = float(range_min)
         self.range_max = float(range_max)
         self.spline_range = self.range_max - self.range_min
         self.inference_samples = inference_samples
 
-        # --- FIX: Random Phase Initialization ---
-        # Instead of starting at (0,0), we start at random positions on the Wilson ring.
-        # This prevents the model from getting stuck in the "zero phase" wedge.
-        
-        # 1. Sample random phases [-pi, pi]
-        random_phases = tf.random.uniform(shape=(self.n_refls,), minval=-np.pi, maxval=np.pi)
-        
-        # 2. Use the Wilson Sigma (scale) as the initial amplitude estimate.
-        #    We multiply by 0.5 to start slightly "inside" the ring, allowing the likelihood to push out.
-        r_init = scale * 0.5 
-        
-        # 3. Convert to Cartesian
-        loc_real = r_init * tf.cos(random_phases)
-        loc_imag = r_init * tf.sin(random_phases)
-        
-        loc_init = tf.stack([loc_real, loc_imag], axis=-1)   # (N, 2)
-        self.base_loc = tf.Variable(loc_init, name='base_loc')
+        # --- FIX: Mixture of 4 Gaussians Base ---
+        # Instead of 1 blob at the origin, we create 4 blobs rotated by 90 degrees.
+        # This topology (4 islands) can easily map to a Ring.
+        n_components = 4
 
-        # FIX: Enforce a minimum scale (epsilon) to prevent Mode Collapse / Overconfidence.
-        # If scale -> 0, FOM -> 1.0, and the model stops learning.
-        # We force scale >= 1e-3.
-        epsilon = 1e-3
-        scale_init = tf.stack([scale, scale], axis=-1)
+        # 1. Mixture Weights (Logits)
+        # Initialize uniform weights (all quadrants equally likely at start)
+        self.mix_logits = tf.Variable(tf.zeros((self.n_refls, n_components)), name='mix_logits')
 
-        # Use Chain: Softplus(x) + epsilon
+        # 2. Component Locations (N, 4, 2)
+        # We place them at radius = scale (Wilson sigma)
+        # Angles: 0, pi/2, pi, 3pi/2
+        r_init = scale
+        angles = tf.constant([0.0, np.pi/2, np.pi, 3*np.pi/2], dtype=tf.float32) # (4,)
+
+        # Broadcast radius and angles
+        r_exp = tf.expand_dims(r_init, -1) # (N, 1)
+        ang_exp = tf.expand_dims(angles, 0) # (1, 4)
+
+        loc_real = r_exp * tf.cos(ang_exp) # (N, 4)
+        loc_imag = r_exp * tf.sin(ang_exp) # (N, 4)
+
+        # Stack into (N, 4, 2)
+        base_loc_init = tf.stack([loc_real, loc_imag], axis=-1)
+        self.base_loc = tf.Variable(base_loc_init, name='base_loc')
+
+        # 3. Component Scales
+        # Initialize small variance so they barely overlap
+        # Shape (N, 4, 2)
+        scale_val = scale * 0.7
+        scale_init = tf.stack([scale_val]*n_components, axis=1) # (N, 4)
+        scale_init = tf.stack([scale_init, scale_init], axis=-1) # (N, 4, 2)
+
         self.base_scale = tfp.util.TransformedVariable(
-            scale_init, 
-            tfb.Chain([tfb.Shift(epsilon), tfb.Softplus()]), 
-            name='base_scale'
+            scale_init, tfb.Softplus(), name='base_scale'
         )
 
-        base_dist = tfd.MultivariateNormalDiag(
-            loc=self.base_loc, 
+        # 4. Construct the Mixture Distribution
+        # We need independent distributions for Real/Imag, but correlated via the Mixture
+        # TFP's MixtureSameFamily handles this.
+
+        # The components are independent Normals in 2D (Diag)
+        components_dist = tfd.MultivariateNormalDiag(
+            loc=self.base_loc,
             scale_diag=self.base_scale
         )
 
+        # The mixture is over the 4 components axis (axis 1)
+        base_dist = tfd.MixtureSameFamily(
+            mixture_distribution=tfd.Categorical(logits=self.mix_logits),
+            components_distribution=components_dist
+        )
+
+        # 5. Flow Layers (Same as before)
         bijectors = []
         self.conditioners = []
-        
+
         for i in range(depth):
-            # A. RealNVP
+            # A. RealNVP (Masking Re/Im)
             w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, name=f'w_{i}')
             h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, name=f'h_{i}')
             s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, name=f's_{i}')
             self.conditioners.append((w_net, h_net, s_net))
-            
+
             bijectors.append(tfb.RealNVP(
-                num_masked=1, 
+                num_masked=1,
                 bijector_fn=lambda x, ou, idx=i: tfb.RationalQuadraticSpline(
                     bin_widths=self.conditioners[idx][0](x),
                     bin_heights=self.conditioners[idx][1](x),
@@ -391,8 +410,6 @@ class ComplexCartesianFlow(SurrogatePosterior):
                     range_min=self.range_min
                 )
             ))
-            
-            # B. Permute
             bijectors.append(tfb.Permute(permutation=[1, 0]))
 
         chain = tfb.Chain(list(reversed(bijectors)))
@@ -400,7 +417,7 @@ class ComplexCartesianFlow(SurrogatePosterior):
 
     @property
     def parameters(self):
-        return {} 
+        return {}
 
     def parameter_properties(self, dtype=tf.float32, num_classes=None):
         return {}
@@ -408,6 +425,7 @@ class ComplexCartesianFlow(SurrogatePosterior):
     def sample(self, n_samples=None):
         if n_samples is None:
             n_samples = self.inference_samples
+        # TFP Mixture sample shape: (n_samples, Batch, Event) -> (S, N, 2)
         z = self.distribution.sample(n_samples)
         return tf.complex(z[..., 0], z[..., 1])
 
@@ -415,7 +433,11 @@ class ComplexCartesianFlow(SurrogatePosterior):
         real = tf.math.real(z_complex)
         imag = tf.math.imag(z_complex)
         z_stacked = tf.stack([real, imag], axis=-1)
+
+        # Calculate log_prob per reflection: Shape (S, N)
         lp = self.distribution.log_prob(z_stacked)
+
+        # FIX: Sum over reflections (axis -1) to match Likelihood shape (S,)
         return tf.reduce_sum(lp, axis=-1)
 
     def mean(self):
