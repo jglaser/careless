@@ -352,10 +352,20 @@ class ComplexCartesianFlow(SurrogatePosterior):
         loc_imag = r_init * tf.sin(random_phases)
         
         loc_init = tf.stack([loc_real, loc_imag], axis=-1)   # (N, 2)
-        scale_init = tf.stack([scale, scale], axis=-1)       # (N, 2)
-
         self.base_loc = tf.Variable(loc_init, name='base_loc')
-        self.base_scale = tfp.util.TransformedVariable(scale_init, tfb.Softplus(), name='base_scale')
+
+        # FIX: Enforce a minimum scale (epsilon) to prevent Mode Collapse / Overconfidence.
+        # If scale -> 0, FOM -> 1.0, and the model stops learning.
+        # We force scale >= 1e-3.
+        epsilon = 1e-3
+        scale_init = tf.stack([scale, scale], axis=-1)
+
+        # Use Chain: Softplus(x) + epsilon
+        self.base_scale = tfp.util.TransformedVariable(
+            scale_init, 
+            tfb.Chain([tfb.Shift(epsilon), tfb.Softplus()]), 
+            name='base_scale'
+        )
 
         base_dist = tfd.MultivariateNormalDiag(
             loc=self.base_loc, 
