@@ -528,7 +528,8 @@ class DataManager():
                 sparse_prior = SparseRealSpacePrior(
                     miller_indices=hkls,
                     positivity_weight=getattr(parser, 'positivity_weight', 1.0),
-                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1)
+                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
+                    tv_weight=getattr(parser, 'tv_weight', 0.05),
                 )
                 prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
 

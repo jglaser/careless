@@ -77,4 +77,13 @@ args_and_kwargs = (
             "default": 0.1,
         },
     ),
-)
+    (
+        ("--tv-weight",),
+            {
+                "help": "Weight for the Total Variation constraint (penalizes density gradients) "
+                "to suppress ringing and noise artifacts. Default is 0.0.",
+                "type": float,
+                "default": 0.05,
+            },
+        ),
+    )
