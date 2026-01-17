@@ -11,8 +11,9 @@ import numpy as np
 class VariationalMergingModel(tfk.models.Model, BaseModel):
     """
     Merge data with a posterior parameterized by a surrogate distribution.
+    Supports Merohedral Twinning via a Mixture Model.
     """
-    def __init__(self, surrogate_posterior, prior, likelihood, scaling_model, mc_sample_size=1, kl_weight=None, scale_kl_weight=None, scale_prior=None):
+    def __init__(self, surrogate_posterior, prior, likelihood, scaling_model, mc_sample_size=1, kl_weight=None, scale_kl_weight=None, scale_prior=None, twin_mappings=None):
         """"
         Parameters
         ----------
@@ -33,6 +34,11 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
             An instance of a class from carless.model.scaling 
         mc_sample_size : int (optional)
             This sets how many reparameterized samples will be used to compute the loss function.
+        twin_mappings : list of arrays/tensors (optional)
+            A list where each element is an integer array mapping indices h -> h_op_k.
+            This enables the "Mixture of Twins" model.
+            The model assumes the first component is always Identity (index 0) and does not need to be provided in this list.
+            If None (default), standard merging is performed.
         """
         super().__init__()
         self.prior = prior
@@ -43,6 +49,29 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         self.kl_weight = kl_weight
         self.scale_kl_weight = scale_kl_weight
         self.scale_prior = scale_prior
+
+        # --- Twinning Setup ---
+        self.twin_mappings = None
+        if twin_mappings is not None:
+            # Convert mappings to int32 constant tensors
+            self.twin_mappings = [
+                tf.constant(m, dtype=tf.int32) for m in twin_mappings
+            ]
+            
+            # Learnable logits for (Identity, Twin_1, Twin_2, ...)
+            # Shape: (1 + num_twin_laws,)
+            # Initialize Identity (index 0) to be slightly preferred (bias=2.0)
+            num_laws = len(twin_mappings)
+            initial_logits = np.zeros(1 + num_laws, dtype=np.float32)
+            initial_logits[0] = 2.0 
+            self.mixture_logits = tf.Variable(initial_logits, name="twin_mixture_logits")
+
+    @property
+    def twin_fractions(self):
+        """Returns probability distribution over [Identity, Twin_1, Twin_2...]"""
+        if self.twin_mappings is None:
+            return None
+        return tf.nn.softmax(self.mixture_logits)
 
     def scale_mean_stddev(self, inputs):
         """
@@ -81,7 +110,7 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
     def prediction_mean_stddev(self, inputs):
         """
         Compute the expected value and uncertainty of the intensities predicted by the model.
-        Correctly handles both Real (TruncatedNormal) and Complex (Flow) structure factors.
+        Correctly handles Real, Complex, and Twinned structure factors.
         """
         refl_id = self.get_refl_id(inputs)
         scale_dist = self.scaling_model(inputs)
@@ -110,17 +139,59 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         if not tf.is_tensor(f2): f2 = tf.convert_to_tensor(f2, dtype=tf.float32)
         if not tf.is_tensor(f4): f4 = tf.convert_to_tensor(f4, dtype=tf.float32)
 
-        # 2. Map global F moments to observations
+        # 2. Map global F moments to observations (Handling Twinning)
         indices = tf.squeeze(refl_id, axis=-1)
-        f2_obs = tf.gather(f2, indices)
-        f4_obs = tf.gather(f4, indices)
+
+        if self.twin_mappings is None:
+            # --- Standard Case ---
+            f2_obs = tf.gather(f2, indices)
+            f4_obs = tf.gather(f4, indices)
+        else:
+            # --- Mixture of Twins Case ---
+            # We must compute the moments of the mixture: I_mix = sum(alpha_k * I_k)
+            alphas = self.twin_fractions # Shape (K+1,)
+            alphas_reshaped = tf.reshape(alphas, (-1, 1))
+
+            # Stack moments for all components [Identity, Twin1, Twin2...]
+            # Identity
+            f2_comps = [tf.gather(f2, indices)]
+            f4_comps = [tf.gather(f4, indices)]
+            
+            # Twins
+            for mapping in self.twin_mappings:
+                twin_idx = tf.gather(mapping, indices)
+                f2_comps.append(tf.gather(f2, twin_idx))
+                f4_comps.append(tf.gather(f4, twin_idx))
+            
+            f2_stack = tf.stack(f2_comps, axis=0) # Shape (K+1, N_obs)
+            f4_stack = tf.stack(f4_comps, axis=0)
+
+            # E[I_mix] = sum(alpha_k * E[I_k])
+            f2_obs = tf.reduce_sum(alphas_reshaped * f2_stack, axis=0)
+
+            # E[I_mix^2] = sum(alpha_k^2 * E[I_k^2]) + sum_{j!=l} (alpha_j * alpha_l * E[I_j] * E[I_l])
+            # We assume independence between surrogate components for j!=l
+            
+            # Diagonal term: sum(alpha^2 * f4)
+            term_diag = tf.reduce_sum(tf.square(alphas_reshaped) * f4_stack, axis=0)
+            
+            # Cross term calculation trick:
+            # (sum(alpha * E[I]))^2 = sum(alpha^2 * E[I]^2) + sum_{j!=l}...
+            # sum_{j!=l} ... = (E[I_mix])^2 - sum(alpha^2 * E[I]^2)
+            
+            E_I_sq_sum = tf.square(f2_obs) 
+            sum_sq_alpha_E_I_sq = tf.reduce_sum(tf.square(alphas_reshaped) * tf.square(f2_stack), axis=0)
+            
+            term_cross = E_I_sq_sum - sum_sq_alpha_E_I_sq
+            
+            f4_obs = term_diag + term_cross
 
         # 3. Compute Intensity Statistics
-        # <I_pred> = <Scale> * <|F|^2>
+        # <I_pred> = <Scale> * <I_mix>
         iexp = scale_dist.mean() * f2_obs
 
         # Var(I_pred) = <I_pred^2> - <I_pred>^2
-        # <I_pred^2> = <Scale^2> * <|F|^4>
+        # <I_pred^2> = <Scale^2> * <I_mix^2>
         # <Scale^2> = Var(Scale) + Mean(Scale)^2
         scale_mean = scale_dist.mean()
         scale_var = tf.square(scale_dist.stddev())
@@ -189,8 +260,35 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
                 self.add_kl_div(scale_dist, self.scale_prior, z_scale, weight=1., reduction='mean', name="Σ KLDiv")
 
         refl_id = self.get_refl_id(inputs)
+        indices = tf.squeeze(refl_id, axis=-1)
 
-        ipred = z_scale * tf.square(tf.gather(z_f, tf.squeeze(refl_id, axis=-1), axis=-1))
+        # --- Twinning Logic (Real SF) ---
+        if self.twin_mappings is not None:
+            # Mixture Model
+            alphas = self.twin_fractions # Shape (K+1,)
+            alphas_reshaped = tf.reshape(alphas, (-1, 1, 1)) # (K+1, 1, 1) for broadcasting
+
+            # Stack I components
+            # Identity
+            I_comps = [tf.square(tf.gather(z_f, indices, axis=-1))]
+            # Twins
+            for mapping in self.twin_mappings:
+                mapped_idx = tf.gather(mapping, indices)
+                I_comps.append(tf.square(tf.gather(z_f, mapped_idx, axis=-1)))
+            
+            I_stack = tf.stack(I_comps, axis=0) # (K+1, mc, batch)
+            
+            # Weighted sum
+            I_base = tf.reduce_sum(alphas_reshaped * I_stack, axis=0)
+            
+            # Metrics
+            for i in range(len(self.twin_mappings)):
+                self.add_metric(alphas[i+1], name=f"TwinFrac_{i+1}")
+        else:
+            # Standard
+            I_base = tf.square(tf.gather(z_f, indices, axis=-1))
+
+        ipred = z_scale * I_base
 
         likelihood = self.likelihood(inputs)
 
@@ -304,6 +402,7 @@ class JointVariationalMergingModel(VariationalMergingModel):
     """
     Variational Model for Joint Refinement of Amplitudes and Phases.
     Handles complex-valued surrogates and global (non-factorizable) priors.
+    Supports Merohedral Twinning via a Mixture Model.
     """
     def call(self, inputs):
         """
@@ -324,15 +423,37 @@ class JointVariationalMergingModel(VariationalMergingModel):
             else:
                 self.add_kl_div(scale_dist, self.scale_prior, z_scale, weight=1., reduction='mean', name="Σ KLDiv")
 
-        # 4. Predict Intensities
-        # I = Scale * |F|^2
         refl_id = self.get_refl_id(inputs)
+        indices = tf.squeeze(refl_id, axis=-1)
 
-        # Gather complex factors for observed reflections
-        z_complex_gathered = tf.gather(z_complex, tf.squeeze(refl_id, axis=-1), axis=-1)
+        # 4. Predict Intensities (With Twinning Support)
+        if self.twin_mappings is not None:
+            # Mixture Model
+            alphas = self.twin_fractions # Shape (K+1,)
+            alphas_reshaped = tf.reshape(alphas, (-1, 1, 1)) # (K+1, 1, 1)
 
-        # Compute Intensity
-        ipred = z_scale * tf.square(tf.abs(z_complex_gathered))
+            # Stack I components
+            # Identity
+            I_comps = [tf.square(tf.abs(tf.gather(z_complex, indices, axis=-1)))]
+            # Twins
+            for mapping in self.twin_mappings:
+                mapped_idx = tf.gather(mapping, indices)
+                I_comps.append(tf.square(tf.abs(tf.gather(z_complex, mapped_idx, axis=-1))))
+            
+            I_stack = tf.stack(I_comps, axis=0) # (K+1, mc, batch)
+            
+            # Weighted sum
+            I_base = tf.reduce_sum(alphas_reshaped * I_stack, axis=0)
+            
+            # Metrics
+            for i in range(len(self.twin_mappings)):
+                self.add_metric(alphas[i+1], name=f"TwinFrac_{i+1}")
+        else:
+            # Standard
+            z_complex_gathered = tf.gather(z_complex, indices, axis=-1)
+            I_base = tf.square(tf.abs(z_complex_gathered))
+
+        ipred = z_scale * I_base
 
         # 5. Likelihood Term
         likelihood = self.likelihood(inputs)

@@ -500,6 +500,39 @@ class DataManager():
                     reindexing_ops = [gemmi.Op(i) for i in reindexing_ops.split(delim)]
                 prior = DoubleWilsonPrior(self.asu_collection, parents, r_values, reindexing_ops, sigma=sigma, optimize_r=parser.optimize_double_wilson_r)
 
+        # --- TWINNING INITIALIZATION ---
+        twin_mappings = None
+        if hasattr(parser, 'twin_laws') and parser.twin_laws is not None:
+            print(f"Initializing Twin Mixture Model with laws: {parser.twin_laws}")
+            twin_ops = [gemmi.Op(op) for op in parser.twin_laws.split(';')]
+            
+            # Use the first ASU (assumes simple merging case)
+            # The lookup table contains all Miller indices in the model's posterior
+            lookup = self.asu_collection.refl_id_lookup_table.sort_index()
+            H_primary = lookup[['H', 'K', 'L']].to_numpy(dtype=np.int32)
+            asu_id = lookup['asu_id'].to_numpy(dtype=np.int32)[:, None]
+            
+            twin_mappings = []
+            for op in twin_ops:
+                # 1. Apply Op: H -> H_twin
+                # Gemmi apply_to_hkl is scalar, so we use list comp or map
+                H_twin_list = [op.apply_to_hkl(h) for h in H_primary]
+                H_twin = np.array(H_twin_list, dtype=np.int32)
+                
+                # 2. Map H_twin back to ReciprocalASUCollection ID
+                # We reuse the `to_refl_id` method which handles ASU mapping via the lookup table
+                # We use allow_missing=True to handle cases where twin maps outside resolution?
+                # Usually resolution shell is symmetric, but let's be safe.
+                mapping = self.asu_collection.to_refl_id(asu_id, H_twin, allow_missing=True)
+                
+                # Replace -1 (missing) with 0 (index 0) to avoid gather errors, 
+                # but this shouldn't happen for merohedral twinning.
+                if np.any(mapping == -1):
+                    print("Warning: Some twin reflections mapped outside the resolution limit.")
+                    mapping[mapping == -1] = 0 
+                    
+                twin_mappings.append(mapping)
+
         # 3. Handle Complex Flow / Joint Prior Mode
         if self.is_complex:
             from careless.models.merging.surrogate_posteriors import ComplexCartesianFlow
@@ -528,15 +561,15 @@ class DataManager():
                 sparse_prior = SparseRealSpacePrior(
                     miller_indices=hkls,
                     positivity_weight=getattr(parser, 'positivity_weight', 1.0),
-                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
-                    tv_weight=getattr(parser, 'tv_weight', 0.05),
+                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1)
                 )
                 prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
 
-            # Use Joint Model class
+            # Use Joint Model class (updated to support twin_mappings)
             model = JointVariationalMergingModel(
                 surrogate_posterior, prior, likelihood, scaling_model, 
-                parser.mc_samples, kl_weight=parser.kl_weight
+                parser.mc_samples, kl_weight=parser.kl_weight,
+                twin_mappings=twin_mappings
             )
 
         # 4. Handle Standard Modes
@@ -559,7 +592,8 @@ class DataManager():
 
             model = VariationalMergingModel(
                 surrogate_posterior, prior, likelihood, scaling_model, 
-                parser.mc_samples, kl_weight=parser.kl_weight
+                parser.mc_samples, kl_weight=parser.kl_weight,
+                twin_mappings=twin_mappings
             )
 
         # 5. Compile

@@ -90,4 +90,11 @@ args_and_kwargs = (
         "type": int,
         "default": 4096,
     }),
+    (("--twin-laws",), {
+        "help": "Semicolon-separated list of twin operators (e.g., 'h,-k,-l' or 'h,-k,-l;-h,k,-l'). "
+                "If provided, careless will refine a mixture of the identity structure and the twin-related structures. "
+                "The twin fractions are learned parameters.",
+        "type": str,
+        "default": None,
+    }),
 )
