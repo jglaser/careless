@@ -512,12 +512,13 @@ class DataManager():
             if surrogate_posterior is None:
                 base_loc = prior.mean()
                 base_scale = tf.sqrt(prior.stddev() / 2.0)
-                
+
                 surrogate_posterior = ComplexCartesianFlow(
                     loc=base_loc,
                     scale=base_scale,
                     depth=parser.flow_depth,
                     hidden_units=parser.flow_hidden_units,
+                    bins=parser.flow_bins,
                     inference_samples=parser.flow_inference_samples,
                     name='structure_factor'
                 )

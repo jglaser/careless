@@ -90,4 +90,11 @@ args_and_kwargs = (
         "type": int,
         "default": 4096,
     }),
+    (("--flow-bins",), {
+        "help": "Number of bins for the Rational Quadratic Spline flow. "
+                "Higher values allow more complex shapes but may be less stable. "
+                "Default: 16",
+        "type": int,
+        "default": 16,
+    }),
 )
