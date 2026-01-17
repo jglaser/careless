@@ -265,47 +265,73 @@ class FlowPosterior(SurrogatePosterior):
 
 class SplineNet(tf.keras.layers.Layer):
     """
-    A helper Keras Layer that predicts spline parameters.
-    Uses 1D Convolutions (kernel_size=1) to allow shared weights across reflections
-    while predicting per-reflection spline parameters.
+    Helper Layer for Rational Quadratic Splines.
+    Supports 'Global Mixing' (Triangular Map) via Low-Rank Factorization.
     """
-    def __init__(self, hidden_units, bins, kind, spline_range, 
-                 min_bin_width=1e-2, min_bin_height=1e-2, min_derivative=1e-2, 
-                 name=None):
+    def __init__(self, hidden_units, bins, kind, spline_range, n_refls=None, mixing_rank=None,
+                 min_bin_width=1e-2, min_bin_height=1e-2, min_derivative=1e-2, name=None):
         super().__init__(name=name)
         self.bins = bins
         self.kind = kind
         self.spline_range = spline_range
-        
-        # Stability Constraints
         self.min_bin_width = min_bin_width
         self.min_bin_height = min_bin_height
         self.min_derivative = min_derivative
-        
-        # Conv1D acts as a shared Dense layer per element
-        # Input: (Batch, N_refls, 1) -> Output: (Batch, N_refls, Hidden)
+
+        # Local (Independent) Convolutions
         self.conv1 = tf.keras.layers.Conv1D(hidden_units, kernel_size=1, activation='relu')
         self.conv2 = tf.keras.layers.Conv1D(hidden_units, kernel_size=1, activation='relu')
-        
-        # Identity Initialization (Zeros)
+
+        # Output projection
         if kind == 'slopes':
             self.conv_out = tf.keras.layers.Conv1D(bins - 1, kernel_size=1, kernel_initializer='zeros')
             self.activation = tf.keras.layers.Activation('softplus')
         else:
             self.conv_out = tf.keras.layers.Conv1D(bins, kernel_size=1, kernel_initializer='zeros')
 
+        # Global Mixing
+        self.use_global = False
+        if n_refls is not None and n_refls < 20000:
+            self.use_global = True
+            
+            # --- FIX: Use Physical Rank if provided, else heuristic ---
+            if mixing_rank is not None:
+                rank = mixing_rank
+            else:
+                rank = int(np.sqrt(n_refls))
+                rank = max(4, min(rank, 64))
+            
+            # Low Rank Matrices
+            self.mix_U = tf.keras.layers.Dense(rank, kernel_initializer='glorot_uniform', use_bias=False, name='mix_U')
+            self.mix_V = tf.keras.layers.Dense(n_refls, kernel_initializer='zeros', use_bias=False, name='mix_V')
+            self.ln = tf.keras.layers.LayerNormalization(axis=1)
+
     def call(self, inputs):
-        # Inputs: (Batch, N_refls, 1)
-        # Note: RealNVP with num_masked=1 and event size 2 passes a scalar per reflection.
-        # But that scalar is in the last dimension. TFP passes (Batch, N_refls, 1).
-        
+        # inputs: (Batch, N_refls, Channels)
+
+        # 1. Local Processing
         x = self.conv1(inputs)
         x = self.conv2(x)
-        logits = self.conv_out(x) # Shape: (Batch, N_refls, bins)
-        
-        # Add singleton dimension for broadcasting against the masked component
-        # Expected Output: (Batch, N_refls, 1, bins) to broadcast against (Batch, N_refls, 1)
-        
+
+        # 2. Low-Rank Global Mixing
+        if self.use_global:
+            # Transpose to (Batch, Channels, N_refls) so Dense acts on reflections
+            x_T = tf.transpose(x, perm=[0, 2, 1])
+
+            # Factorized Dense: x @ U @ V
+            # U reduces dim to 'rank', V expands back to 'N_refls'
+            # Initialize V with zeros -> Identity map at start -> No bias
+            x_low = self.mix_U(x_T)
+            x_global = self.mix_V(x_low)
+
+            # Transpose back
+            x_global = tf.transpose(x_global, perm=[0, 2, 1])
+
+            # Residual connection with norm
+            x = self.ln(x + x_global)
+
+        logits = self.conv_out(x)
+
         if self.kind == 'slopes':
             out = self.activation(logits) + self.min_derivative
             return tf.expand_dims(out, -2)
@@ -321,13 +347,10 @@ class SplineNet(tf.keras.layers.Layer):
             return tf.expand_dims(out, -2)
 
 class ComplexCartesianFlow(SurrogatePosterior):
-    """
-    A Surrogate Posterior for Complex Structure Factors using a Mixture Base.
-    Uses 4 components per reflection to topologically cover the full phase ring.
-    """
+    """ Surrogate Posterior for Complex Structure Factors using a Mixture Base. """
     def __init__(self, loc, scale, depth=4, hidden_units=32, bins=16,
                  range_min=-10.0, range_max=10.0, inference_samples=1,
-                 name='ComplexCartesianFlow', **kwargs):
+                 mixing_rank=None, name='ComplexCartesianFlow', **kwargs):
 
         super().__init__(distribution=None, name=name, **kwargs)
 
@@ -337,68 +360,51 @@ class ComplexCartesianFlow(SurrogatePosterior):
         self.spline_range = self.range_max - self.range_min
         self.inference_samples = inference_samples
 
-        # --- FIX: Mixture of 4 Gaussians Base ---
-        # Instead of 1 blob at the origin, we create 4 blobs rotated by 90 degrees.
-        # This topology (4 islands) can easily map to a Ring.
-        n_components = 4
+        # Diagnostic: Check correlation complexity
+        use_global = self.n_refls < 20000
+        if use_global:
+            print(f"\n[Global Mixing] Dense Triangular Map ENABLED for {self.n_refls} reflections.")
+        else:
+            print(f"\n[Global Mixing] DISABLED (N={self.n_refls} > 20000). Using Independent Flow.\n")
 
-        # 1. Mixture Weights (Logits)
-        # Initialize uniform weights (all quadrants equally likely at start)
+        # 4-Component Mixture Base
+        n_components = 4
         self.mix_logits = tf.Variable(tf.zeros((self.n_refls, n_components)), name='mix_logits')
 
-        # 2. Component Locations (N, 4, 2)
-        # We place them at radius = scale (Wilson sigma)
-        # Angles: 0, pi/2, pi, 3pi/2
         r_init = scale
-        angles = tf.constant([0.0, np.pi/2, np.pi, 3*np.pi/2], dtype=tf.float32) # (4,)
+        angles = tf.constant([0.0, np.pi/2, np.pi, 3*np.pi/2], dtype=tf.float32)
+        r_exp = tf.expand_dims(r_init, -1)
+        ang_exp = tf.expand_dims(angles, 0)
 
-        # Broadcast radius and angles
-        r_exp = tf.expand_dims(r_init, -1) # (N, 1)
-        ang_exp = tf.expand_dims(angles, 0) # (1, 4)
-
-        loc_real = r_exp * tf.cos(ang_exp) # (N, 4)
-        loc_imag = r_exp * tf.sin(ang_exp) # (N, 4)
-
-        # Stack into (N, 4, 2)
+        loc_real = r_exp * tf.cos(ang_exp)
+        loc_imag = r_exp * tf.sin(ang_exp)
         base_loc_init = tf.stack([loc_real, loc_imag], axis=-1)
         self.base_loc = tf.Variable(base_loc_init, name='base_loc')
 
-        # 3. Component Scales
-        # Initialize small variance so they barely overlap
-        # Shape (N, 4, 2)
         scale_val = scale * 0.7
-        scale_init = tf.stack([scale_val]*n_components, axis=1) # (N, 4)
-        scale_init = tf.stack([scale_init, scale_init], axis=-1) # (N, 4, 2)
+        scale_init = tf.stack([scale_val]*n_components, axis=1)
+        scale_init = tf.stack([scale_init, scale_init], axis=-1)
 
         self.base_scale = tfp.util.TransformedVariable(
             scale_init, tfb.Softplus(), name='base_scale'
         )
 
-        # 4. Construct the Mixture Distribution
-        # We need independent distributions for Real/Imag, but correlated via the Mixture
-        # TFP's MixtureSameFamily handles this.
-
-        # The components are independent Normals in 2D (Diag)
         components_dist = tfd.MultivariateNormalDiag(
-            loc=self.base_loc,
-            scale_diag=self.base_scale
+            loc=self.base_loc, scale_diag=self.base_scale
         )
-
-        # The mixture is over the 4 components axis (axis 1)
         base_dist = tfd.MixtureSameFamily(
             mixture_distribution=tfd.Categorical(logits=self.mix_logits),
             components_distribution=components_dist
         )
 
-        # 5. Flow Layers (Same as before)
         bijectors = []
         self.conditioners = []
 
         for i in range(depth):
-            # A. RealNVP (Masking Re/Im)
-            w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, name=f'w_{i}')
-            h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, name=f'h_{i}')
-            s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, name=f's_{i}')
+            # Pass n_refls to SplineNet to enable Global Mixing if N is small
+            w_net = SplineNet(hidden_units, bins, 'widths', self.spline_range, n_refls=self.n_refls, mixing_rank=mixing_rank, name=f'w_{i}')
+            h_net = SplineNet(hidden_units, bins, 'heights', self.spline_range, n_refls=self.n_refls, mixing_rank=mixing_rank, name=f'h_{i}')
+            s_net = SplineNet(hidden_units, bins, 'slopes', self.spline_range, n_refls=self.n_refls, mixing_rank=mixing_rank, name=f's_{i}')
             self.conditioners.append((w_net, h_net, s_net))
 
             bijectors.append(tfb.RealNVP(
@@ -423,9 +429,7 @@ class ComplexCartesianFlow(SurrogatePosterior):
         return {}
 
     def sample(self, n_samples=None):
-        if n_samples is None:
-            n_samples = self.inference_samples
-        # TFP Mixture sample shape: (n_samples, Batch, Event) -> (S, N, 2)
+        if n_samples is None: n_samples = self.inference_samples
         z = self.distribution.sample(n_samples)
         return tf.complex(z[..., 0], z[..., 1])
 
@@ -433,11 +437,7 @@ class ComplexCartesianFlow(SurrogatePosterior):
         real = tf.math.real(z_complex)
         imag = tf.math.imag(z_complex)
         z_stacked = tf.stack([real, imag], axis=-1)
-
-        # Calculate log_prob per reflection: Shape (S, N)
         lp = self.distribution.log_prob(z_stacked)
-
-        # FIX: Sum over reflections (axis -1) to match Likelihood shape (S,)
         return tf.reduce_sum(lp, axis=-1)
 
     def mean(self):
