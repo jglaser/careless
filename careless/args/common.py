@@ -58,16 +58,30 @@ args_and_kwargs = (
         "action" : "store_true",
         "default" : False,
     }),
+    
+    # --- UPDATED SURROGATE OPTIONS ---
     (("--surrogate-posterior",), {
-        "help": "Type of surrogate posterior distribution. 'truncated_normal' assumes independent structure factors (Mean Field). "
-                "'flow' uses a Normalizing Flow to capture correlations and non-Gaussian shapes. Default: 'truncated_normal'",
+        "help": "Type of surrogate posterior distribution. \n"
+                "'truncated_normal': Independent structure factors (Standard). \n"
+                "'flow': Independent Normalizing Flow. \n"
+                "'complex_flow': Flow on Complex Plane (Amplitudes + Phases). \n"
+                "'real_space_grid_flow': Dense 3D CNN Flow on Electron Density. \n"
+                "Default: 'truncated_normal'",
         "type": str,
         "default": "truncated_normal",
-        "choices": ["truncated_normal", "flow", "complex_flow"]
+        "choices": ["truncated_normal", "flow", "complex_flow", "real_space_grid_flow"]
     }),
 
+    (("--algorithm",), {
+        "help": "Optimization algorithm. 'vi' (Variational Inference) or 'sgld' (Stochastic Gradient Langevin Dynamics). Default: 'vi'",
+        "type": str,
+        "default": "vi",
+        "choices": ["vi", "sgld"]
+    }),
+
+    # --- FLOW OPTIONS ---
     (("--flow-depth",), {
-        "help": "Number of bijector layers for the normalizing flow posterior. Only used if --surrogate-posterior=flow. Default: 2",
+        "help": "Number of bijector layers for the normalizing flow posterior. Default: 2",
         "type": int,
         "default": 2,
     }),
@@ -77,48 +91,33 @@ args_and_kwargs = (
         "type": int,
         "default": 16,
     }),
+    
     (("--flow-inference-samples",), {
         "help": "Number of Monte Carlo samples used to estimate mean and stddev for Flow posteriors during inference (MTZ output). "
                 "Higher values give more precise moments but are slower and use more memory. Default: 100",
         "type": int,
         "default": 100,
     }),
-    (("--stochastic-points",), {
-        "help": "Number of random real-space points to sample per step for constraints (Positivity/Sparsity) in sparse mode. "
-                "Higher values improve constraint quality but slow down training. "
-                "Set to 0 to disable. Default: 4096",
-        "type": int,
-        "default": 4096,
-    }),
-    (("--flow-bins",), {
-        "help": "Number of bins for the Rational Quadratic Spline flow. "
-                "Higher values allow more complex shapes but may be less stable. "
-                "Default: 16",
-        "type": int,
-        "default": 16,
-    }),
-    (("--algorithm",), {
-        "help": "Optimization algorithm to use. "
-                "'vi': Variational Inference (Default). Optimizes a distribution (Flow/Normal) via Adam. "
-                "'sgld': Stochastic Gradient Langevin Dynamics. Samples the posterior directly using a Particle surrogate and Dense priors.",
-        "type": str,
-        "default": "vi",
-        "choices": ["vi", "sgld"]
-    }),
+
+    # --- DENSE MODEL OPTIONS ---
     (("--grid-shape",), {
         "help": "Dimensions of the real-space density grid (nz, ny, nx) for RealSpaceGridFlow or SGLD. "
-                "If not provided, it will be estimated automatically from the unit cell and resolution "
-                "to ensure proper sampling (Nyquist * 2). "
-                "Explicitly providing this overrides the automatic estimation.",
+                "If not provided, it is auto-detected from d_min (Nyquist).",
         "type": int,
         "nargs": 3,
         "metavar": ('NZ', 'NY', 'NX'),
         "default": None,
     }),
-    (("--sgld-friction",), {
-        "help": "Friction coefficient for SGLD optimizer (if using --algorithm sgld). "
-                "Controls the transition from optimization (high friction) to sampling (low friction). Default: 0.9",
-        "type": float,
-        "default": 0.9,
+
+    (("--cnn-filters",), {
+        "help": "Number of filters (channels) in the 3D CNN layers of RealSpaceGridFlow. Default: 32",
+        "type": int,
+        "default": 32,
+    }),
+
+    (("--stochastic-points",), {
+        "help": "Number of random points for stochastic real-space priors (if grid is not used). Default: 4096",
+        "type": int,
+        "default": 4096,
     }),
 )

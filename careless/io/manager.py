@@ -504,8 +504,13 @@ class DataManager():
 
         # --- 3. Grid Size Auto-Detection ---
         grid_shape = getattr(parser, 'grid_shape', None)
-        needs_grid = (getattr(parser, 'algorithm', 'vi') == 'sgld') or \
-                     (getattr(parser, 'surrogate_posterior', '') == 'real_space_grid_flow')
+        
+        # OLD LINE:
+        # needs_grid = (getattr(parser, 'algorithm', 'vi') == 'sgld') or \
+        #              (getattr(parser, 'surrogate_posterior', '') == 'real_space_grid_flow')
+
+        # NEW LINE: Auto-detect grid for ANY complex model (enables Dense Prior for complex_flow)
+        needs_grid = self.is_complex
 
         if needs_grid and grid_shape is None:
             d_min = self.asu_collection.dHKL.min()
@@ -576,22 +581,23 @@ class DataManager():
             return model
 
 
-        # === B. Variational Inference (VI) ===
+        # === B. Variational Inference (VI) - Default ===
         elif self.is_complex:
+            # --- Complex Flow Mode ---
             from careless.models.merging.surrogate_posteriors import ComplexCartesianFlow, RealSpaceGridFlow
             from careless.models.priors.base import JointPrior
-            from careless.models.priors.empirical import SparseRealSpacePrior
+            from careless.models.priors.empirical import DenseRealSpacePrior, SparseRealSpacePrior # Import Both
             from careless.models.merging.variational import JointVariationalMergingModel
 
             print("Initializing Complex VI Model...")
 
+            # 1. Surrogate
             if surrogate_posterior is None:
                 if getattr(parser, 'surrogate_posterior', '') == 'real_space_grid_flow':
                     if grid_shape is None:
                         raise ValueError("RealSpaceGridFlow requires grid shape.")
                     
                     hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
-                    
                     surrogate_posterior = RealSpaceGridFlow(
                         miller_indices=hkls,
                         grid_shape=tuple(grid_shape),
@@ -601,6 +607,7 @@ class DataManager():
                         name='structure_factor'
                     )
                 else:
+                    # Default: ComplexCartesianFlow
                     base_loc = prior.mean()
                     base_scale = tf.sqrt(prior.stddev() / 2.0)
                     
@@ -613,22 +620,37 @@ class DataManager():
                         name='structure_factor'
                     )
 
+            # 2. Prior (UPGRADED)
             if not isinstance(prior, JointPrior):
-                hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
-                sparse_prior = SparseRealSpacePrior(
-                    miller_indices=hkls,
-                    n_points=getattr(parser, 'stochastic_points', 4096),
-                    positivity_weight=getattr(parser, 'positivity_weight', 1.0),
-                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
-                    tv_weight=getattr(parser, 'tv_weight', 0.0)
-                )
-                prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
+                # Check if we can use the Dense Prior (Better gradients, enforcing symmetry)
+                if grid_shape is not None:
+                    print(f"Using Dense Real-Space Prior on grid {grid_shape} (TV={getattr(parser, 'tv_weight', 0.0)})")
+                    real_space_prior = DenseRealSpacePrior(
+                        asu_collection=self.asu_collection,
+                        grid_size=tuple(grid_shape),
+                        tv_weight=getattr(parser, 'tv_weight', 0.0),
+                        positivity_weight=getattr(parser, 'positivity_weight', 0.0),
+                        sparsity_weight=getattr(parser, 'sparsity_weight', 0.0)
+                    )
+                else:
+                    # Fallback to Stochastic if grid not detected (shouldn't happen with auto-detect)
+                    print("Using Stochastic Sparse Prior")
+                    hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
+                    real_space_prior = SparseRealSpacePrior(
+                        miller_indices=hkls,
+                        n_points=getattr(parser, 'stochastic_points', 4096),
+                        positivity_weight=getattr(parser, 'positivity_weight', 1.0),
+                        sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
+                        tv_weight=getattr(parser, 'tv_weight', 0.0)
+                    )
+                
+                prior = JointPrior(wilson_prior=prior, sparse_prior=real_space_prior)
 
+            # 3. Model
             model = JointVariationalMergingModel(
                 surrogate_posterior, prior, likelihood, scaling_model, 
                 parser.mc_samples, kl_weight=parser.kl_weight
             )
-
         else:
             # Standard Real Mode
             if surrogate_posterior is None:
