@@ -455,3 +455,66 @@ class ComplexCartesianFlow(SurrogatePosterior):
     def moment_4_intensity(self):
         z = self.sample(self.inference_samples)
         return tf.reduce_mean(tf.pow(tf.abs(z), 4), axis=0)
+
+class ParticleSurrogate(SurrogatePosterior):
+    """
+    A simple surrogate that holds explicit structure factor instances (particles).
+    Intended for use with SGLD or MAP estimation.
+    """
+    def __init__(self, n_refls, n_particles=1, initial_loc=None, initial_scale=1.0, name='ParticleSurrogate', **kwargs):
+        super().__init__(distribution=None, name=name, **kwargs)
+        self.n_refls = n_refls
+        self.n_particles = n_particles
+
+        # Initialize particles (Float32 storage for optimizer compatibility)
+        if initial_loc is None:
+            # Random init centered at 0
+            init_val = tf.random.normal((n_particles, n_refls, 2), stddev=initial_scale)
+        else:
+            # Broadcast initial location
+            if initial_loc.dtype.is_complex:
+                loc = tf.stack([tf.math.real(initial_loc), tf.math.imag(initial_loc)], axis=-1)
+            else:
+                loc = initial_loc
+            init_val = loc + tf.random.normal((n_particles, n_refls, 2), stddev=initial_scale * 0.1)
+
+        self.particles = tf.Variable(init_val, name='particles', dtype=tf.float32)
+
+    def sample(self, n_samples=None):
+        # SGLD particles represent the distribution directly.
+        # We ignore n_samples and return the full ensemble.
+        z = tf.complex(self.particles[..., 0], self.particles[..., 1])
+        return z
+
+    def log_prob(self, z):
+        # SGLD entropy is constant/zero.
+        # Must reduce over reflections to match shape (Batch,)
+        return tf.reduce_sum(tf.zeros_like(tf.math.real(z)), axis=-1)
+
+    @property
+    def parameters(self):
+        return {}
+
+    def parameter_properties(self, dtype=tf.float32, num_classes=None):
+        return {}
+
+    def mean(self):
+        # <F> (Complex Centroid)
+        z = self.sample()
+        return tf.reduce_mean(z, axis=0)
+
+    def stddev(self):
+        # Sigma(|F|)
+        z = self.sample()
+        return tf.math.reduce_std(tf.abs(z), axis=0)
+
+    # --- FIX: Add Intensity Moments for Prediction ---
+    def mean_intensity(self):
+        # <|F|^2>
+        z = self.sample()
+        return tf.reduce_mean(tf.square(tf.abs(z)), axis=0)
+
+    def moment_4_intensity(self):
+        # <|F|^4>
+        z = self.sample()
+        return tf.reduce_mean(tf.pow(tf.abs(z), 4), axis=0)

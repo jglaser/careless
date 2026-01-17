@@ -97,4 +97,28 @@ args_and_kwargs = (
         "type": int,
         "default": 16,
     }),
+    (("--algorithm",), {
+        "help": "Optimization algorithm to use. "
+                "'vi': Variational Inference (Default). Optimizes a distribution (Flow/Normal) via Adam. "
+                "'sgld': Stochastic Gradient Langevin Dynamics. Samples the posterior directly using a Particle surrogate and Dense priors.",
+        "type": str,
+        "default": "vi",
+        "choices": ["vi", "sgld"]
+    }),
+    (("--grid-shape",), {
+        "help": "Dimensions of the real-space density grid (nz, ny, nx) for RealSpaceGridFlow or SGLD. "
+                "If not provided, it will be estimated automatically from the unit cell and resolution "
+                "to ensure proper sampling (Nyquist * 2). "
+                "Explicitly providing this overrides the automatic estimation.",
+        "type": int,
+        "nargs": 3,
+        "metavar": ('NZ', 'NY', 'NX'),
+        "default": None,
+    }),
+    (("--sgld-friction",), {
+        "help": "Friction coefficient for SGLD optimizer (if using --algorithm sgld). "
+                "Controls the transition from optimization (high friction) to sampling (low friction). Default: 0.9",
+        "type": float,
+        "default": 0.9,
+    }),
 )

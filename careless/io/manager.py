@@ -7,6 +7,65 @@ from .asu import ReciprocalASU, ReciprocalASUCollection
 from careless.models.base import BaseModel
 from careless.models.priors.wilson import WilsonPrior, DoubleWilsonPrior
 
+
+class pSGLD(tfk.optimizers.Optimizer):
+    """
+    Stochastic Gradient Langevin Dynamics with RMSProp preconditioning.
+    Compatible with Keras Eager Execution.
+    """
+    def __init__(self, learning_rate=0.001, precondition_decay=0.95, epsilon=1e-7, name="pSGLD", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.precondition_decay = precondition_decay
+        self.epsilon = epsilon
+
+    def build(self, var_list):
+        # 1. Initialize Parent (Keras) structures first
+        super().build(var_list)
+
+        if hasattr(self, "_built") and self._built:
+            return
+
+        # 2. Initialize our custom preconditioners
+        self.preconditioners = []
+        self._var_to_index = {} # Use a custom map name to avoid conflict
+
+        for i, var in enumerate(var_list):
+            self.preconditioners.append(self.add_variable_from_reference(var, "preconditioner"))
+            # Use var.ref() as the key for reliable lookup in Eager mode
+            self._var_to_index[var.ref()] = i
+
+        self._built = True
+
+    def update_step(self, gradient, variable):
+        lr = tf.cast(self.learning_rate, variable.dtype)
+        if isinstance(self.learning_rate, tfk.optimizers.schedules.LearningRateSchedule):
+            lr = self.learning_rate(self.iterations)
+            lr = tf.cast(lr, variable.dtype)
+
+        # Lookup our custom index
+        if variable.ref() not in self._var_to_index:
+            return # Should not happen if build() was called correctly
+
+        idx = self._var_to_index[variable.ref()]
+        preconditioner = self.preconditioners[idx]
+
+        # 1. Update Preconditioner (RMSProp style)
+        new_pre = self.precondition_decay * preconditioner + (1.0 - self.precondition_decay) * tf.square(gradient)
+        preconditioner.assign(new_pre)
+
+        # 2. Compute Preconditioned Gradient
+        pre_sqrt = tf.sqrt(new_pre + self.epsilon)
+
+        # 3. Langevin Update
+        # theta_new = theta - lr * grad / M + noise
+        scaled_grad = gradient / pre_sqrt
+        noise_std = tf.sqrt(2.0 * lr / pre_sqrt)
+        noise = tf.random.normal(tf.shape(variable), stddev=noise_std, dtype=variable.dtype)
+
+        new_var = variable - lr * scaled_grad + noise
+        variable.assign(new_var)
+
 class DataManager():
     """
     This class comprises various data manipulation methods as well as methods to aid in model construction.
@@ -25,12 +84,15 @@ class DataManager():
         self.asu_collection = asu_collection
         self.parser = parser
         
-        # Determine if we are handling complex structure factors (Amplitude + Phase)
+        # Determine if we are handling complex structure factors
         self.is_complex = False
         if self.parser is not None:
             if hasattr(self.parser, 'surrogate_posterior'):
-                if self.parser.surrogate_posterior == 'complex_flow':
+                if self.parser.surrogate_posterior in ('complex_flow', 'real_space_grid_flow'):
                     self.is_complex = True
+            # Also set complex if using SGLD algorithm
+            if hasattr(self.parser, 'algorithm') and self.parser.algorithm == 'sgld':
+                self.is_complex = True
 
     @classmethod
     def from_pickle(cls, filename):
@@ -75,14 +137,6 @@ class DataManager():
         )
 
     def get_tf_dataset(self, inputs=None):
-        """
-        Pack a dataset in the way that keras and careless expect.
-
-        Parameters
-        ----------
-        inputs : tuple (optional)
-            If None, self.inputs will be used
-        """
         if inputs is None:
             inputs = self.inputs
 
@@ -94,25 +148,6 @@ class DataManager():
         return tfds.batch(len(iobs))
 
     def get_predictions(self, model, inputs=None, test_value=0):
-        """ 
-        Extract results from a surrogate_posterior.
-
-        Parameters
-        ----------
-        model : VariationalMergingModel
-            A merging model from careless
-        inputs : tuple (optional)
-            Inputs for which to make the predictions if None, self.inputs is used.
-        test_value : int (optional)
-            Optionally change the value of the `test` column used for crossvalidation.
-            The default is 0. 
-
-        Returns
-        -------
-        predictions : tuple
-            A tuple of rs.DataSet objects containing the predictions for each 
-            ReciprocalASU contained in self.asu_collection
-        """
         laue = BaseModel.is_laue(inputs)
 
         if inputs is None:
@@ -169,42 +204,24 @@ class DataManager():
 
 
     def get_results(self, surrogate_posterior, inputs=None, output_parameters=True, max_intensity_snr=1e-5):
-        """
-        Extract results from a surrogate_posterior.
-        """
         if inputs is None:
             inputs = self.inputs
 
         # 1. Retrieve Statistics based on Complexity Flag
         if self.is_complex:
             # --- Complex Case ---
-            # 1. Compute Centroid <F> (Vector Average)
-            # This vector's phase is the "Best Phase".
-            # Its magnitude includes the phase weighting (it shrinks if phase is ambiguous).
             F_centroid_complex = surrogate_posterior.mean().numpy()
-
-            # 2. Compute Mean Amplitude <|F|>
-            # We need samples for this (E[|x|] != |E[x]|)
-            # Use a decent sample size for stable FOM
             samples = surrogate_posterior.sample(200).numpy()
             samples_amp = np.abs(samples)
             mean_amp = np.mean(samples_amp, axis=0) # <|F|>
 
-            # 3. Compute FOM
-            # FOM = |<F>| / <|F|>
             abs_centroid = np.abs(F_centroid_complex)
             FOM = np.divide(abs_centroid, mean_amp, out=np.zeros_like(mean_amp), where=mean_amp!=0)
-            FOM = np.clip(FOM, 0.0, 1.0) # Clip for numerical safety
+            FOM = np.clip(FOM, 0.0, 1.0) 
 
-            # 4. Set Output Columns
-            # Convention:
-            # 'F' column usually holds the Mean Amplitude <|F|> (unweighted).
-            # 'FOM' holds the weight.
-            # Phenix/CCP4 will compute map coefficients as F * FOM * exp(i*PHI)
             F = mean_amp
             PHI = np.angle(F_centroid_complex, deg=True)
 
-            # Intensity Statistics
             if hasattr(surrogate_posterior, 'mean_intensity'):
                 I = surrogate_posterior.mean_intensity().numpy()
             else:
@@ -218,7 +235,7 @@ class DataManager():
             SigF = surrogate_posterior.stddev().numpy()
 
         else:
-            # --- Standard (Real/Amplitude) Case ---
+            # --- Standard Case ---
             F = surrogate_posterior.mean().numpy()
             SigF = surrogate_posterior.stddev().numpy()
             I = SigF * SigF + F * F
@@ -228,8 +245,6 @@ class DataManager():
             except:
                  f4 = surrogate_posterior.moment_4(n_samples=100).numpy()
 
-        # 2. Compute Intensity Uncertainty
-        # var(I) = <I^2> - <I>^2
         ivar = np.square(I * max_intensity_snr)
         ivar = np.maximum(ivar, f4 - I * I)
         SigI = np.sqrt(ivar)
@@ -253,7 +268,6 @@ class DataManager():
         for i,asu in enumerate(self.asu_collection):
             idx = (asu_id == i).flatten()
 
-            # Prepare Data Dictionary
             data_dict = {
                 'H' : h[idx], 'K' : k[idx], 'L' : l[idx],
                 'F' : F[idx], 'SigF' : SigF[idx],
@@ -263,7 +277,7 @@ class DataManager():
 
             if self.is_complex:
                 data_dict['PHI'] = rs.DataSeries(PHI[idx], dtype='P')
-                data_dict['FOM'] = rs.DataSeries(FOM[idx], dtype='W') # 'W' is standard MTZ weight type
+                data_dict['FOM'] = rs.DataSeries(FOM[idx], dtype='W')
 
             output = rs.DataSet(
                 data_dict,
@@ -277,10 +291,8 @@ class DataManager():
                     val = params[key]
                     output[key] = rs.DataSeries(val[idx], index=output.index, dtype='R')
 
-            # Remove unobserved refls
             output = output[output.N > 0]
 
-            # Reformat anomalous data
             if asu.anomalous:
                 output = output.unstack_anomalous()
                 anom_keys = [
@@ -299,9 +311,6 @@ class DataManager():
 
     # <-- start xval data splitting methods
     def split_mono_data_by_mask(self, test_idx):
-        """
-        Method for splitting mono data given a boolean mask. 
-        """
         test,train = (),()
         for inp in self.inputs:
             test  += (inp[ test_idx.flatten(),...] ,)
@@ -309,9 +318,6 @@ class DataManager():
         return train, test
 
     def split_data_by_refl(self, test_fraction=0.5):
-        """
-        Method for splitting data given a boolean mask. 
-        """
         if BaseModel.is_laue(self.inputs):
             harmonic_id = BaseModel.get_harmonic_id(self.inputs)
             test_idx = (np.random.random(harmonic_id.max()+1) <= test_fraction)[harmonic_id]
@@ -323,9 +329,6 @@ class DataManager():
         return train, test
 
     def split_laue_data_by_mask(self, test_idx):
-        """
-        Method for splitting laue data given a boolean mask. 
-        """
         harmonic_id = BaseModel.get_harmonic_id(self.inputs)
 
         isect = np.intersect1d(
@@ -354,9 +357,6 @@ class DataManager():
         return split(self.inputs, ~test_idx), split(self.inputs, test_idx)
 
     def split_data_by_image(self, test_fraction=0.5):
-        """
-        Method for splitting data given a boolean mask. 
-        """
         image_id = BaseModel.get_image_id(self.inputs)
         test_idx = np.random.random(image_id.max()+1) <= test_fraction
 
@@ -374,7 +374,6 @@ class DataManager():
     # --> end xval data splitting methods
 
     def get_likelihood(self, parser=None):
-        """Construct the likelihood function based on parser arguments."""
         if parser is None:
             parser = self.parser
         
@@ -399,7 +398,6 @@ class DataManager():
         return likelihood
 
     def get_scaling_model(self, parser=None):
-        """Construct the scaling model based on parser arguments."""
         from careless.models.scaling.image import HybridImageScaler, ImageScaler, NeuralImageScaler
         from careless.models.scaling.nn import MLPScaler
         from careless.models.scaling.spectral import TabulatedSpectralScaler
@@ -466,30 +464,32 @@ class DataManager():
 
     def build_model(self, parser=None, surrogate_posterior=None, prior=None, likelihood=None, scaling_model=None, mc_sample_size=None):
         """
-        Build the model specified in parser, a careless.parser.parser.parse_args() result. Optionally override any of the 
-        parameters taken by the VariationalMergingModel constructor.
-        The `parser` parameter is required if self.parser is not set. 
+        Build the model specified in parser.
+        Supports both Variational Inference (VI) and SGLD algorithms.
         """
         from careless.models.merging.surrogate_posteriors import TruncatedNormal, FlowPosterior
         from careless.models.merging.variational import VariationalMergingModel
+        import tf_keras as tfk
+        import tensorflow_probability as tfp
+        import gemmi
         
         if parser is None:
             parser = self.parser
         if parser is None:
             raise ValueError("No parser supplied, but self.parser is unset")
 
-        # 1. Setup Likelihood and Scaling Model (using helper methods)
+        # --- 1. Setup Likelihood and Scaling (Shared) ---
         if likelihood is None:
             likelihood = self.get_likelihood(parser)
         if scaling_model is None:
             scaling_model = self.get_scaling_model(parser)
 
-        # 2. Setup Prior (if not provided)
+        # --- 2. Setup Base Prior (Reciprocal Space / Wilson) ---
         if prior is None:
             parents = parser.parents
             r_values = parser.dwr
             if parents is None:
-                prior = self.get_wilson_prior(parser.wilson_prior_b)
+                wilson_prior = self.get_wilson_prior(parser.wilson_prior_b)
             else:
                 parents = [None if i == 'None' else int(i) for i in parents.split(',')]
                 r_values = [float(i) for i in r_values.split(',')]
@@ -498,50 +498,139 @@ class DataManager():
                 if reindexing_ops is not None:
                     delim = ';'
                     reindexing_ops = [gemmi.Op(i) for i in reindexing_ops.split(delim)]
-                prior = DoubleWilsonPrior(self.asu_collection, parents, r_values, reindexing_ops, sigma=sigma, optimize_r=parser.optimize_double_wilson_r)
+                wilson_prior = DoubleWilsonPrior(self.asu_collection, parents, r_values, reindexing_ops, sigma=sigma, optimize_r=parser.optimize_double_wilson_r)
+            
+            prior = wilson_prior
 
-        # 3. Handle Complex Flow / Joint Prior Mode
-        if self.is_complex:
-            from careless.models.merging.surrogate_posteriors import ComplexCartesianFlow
+        # --- 3. Grid Size Auto-Detection ---
+        grid_shape = getattr(parser, 'grid_shape', None)
+        needs_grid = (getattr(parser, 'algorithm', 'vi') == 'sgld') or \
+                     (getattr(parser, 'surrogate_posterior', '') == 'real_space_grid_flow')
+
+        if needs_grid and grid_shape is None:
+            d_min = self.asu_collection.dHKL.min()
+            cell = self.asu_collection.reciprocal_asus[0].cell
+            target_spacing = d_min / 2.0 
+            nx = int(cell.a / target_spacing)
+            ny = int(cell.b / target_spacing)
+            nz = int(cell.c / target_spacing)
+            grid_shape = (nx, ny, nz)
+            print(f"Auto-detected FFT Grid Shape for d_min={d_min:.2f}A: {grid_shape}")
+
+        # --- 4. Algorithm Branching ---
+        
+        # === A. SGLD Algorithm ===
+        if getattr(parser, 'algorithm', 'vi') == 'sgld':
+            print(f"Initializing SGLD Model with Dense Real-Space Prior (TV={getattr(parser, 'tv_weight', 0.0)})...")
+            from careless.models.merging.surrogate_posteriors import ParticleSurrogate
+            from careless.models.priors.empirical import DenseRealSpacePrior
             from careless.models.priors.base import JointPrior
-            from careless.models.priors.empirical import SparseRealSpacePrior
             from careless.models.merging.variational import JointVariationalMergingModel
 
-            print("Initializing Complex Cartesian Flow and Joint Prior...")
+            if grid_shape is None:
+                raise ValueError("Could not estimate grid shape for SGLD.")
 
+            # 1. Surrogate: Particles (Centered at 0, Correct Variance)
             if surrogate_posterior is None:
-                base_loc = prior.mean()
-                base_scale = tf.sqrt(prior.stddev() / 2.0)
-
-                surrogate_posterior = ComplexCartesianFlow(
-                    loc=base_loc,
-                    scale=base_scale,
-                    depth=parser.flow_depth,
-                    hidden_units=parser.flow_hidden_units,
-                    bins=parser.flow_bins,
-                    inference_samples=parser.flow_inference_samples,
+                init_scale = tf.sqrt(prior.sigma / 2.0)
+                surrogate_posterior = ParticleSurrogate(
+                    n_refls=len(prior.mean()),
+                    n_particles=parser.mc_samples,
+                    initial_loc=None, 
+                    initial_scale=init_scale,
                     name='structure_factor'
                 )
 
+            # 2. Prior: Joint (Wilson + Dense Real-Space)
             if not isinstance(prior, JointPrior):
-                # Retrieve HKLs via lookup_table (fix for AttributeError)
-                hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
-                sparse_prior = SparseRealSpacePrior(
-                    miller_indices=hkls,
-                    positivity_weight=getattr(parser, 'positivity_weight', 1.0),
-                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
-                    tv_weight=getattr(parser, 'tv_weight', 0.05),
+                dense_prior = DenseRealSpacePrior(
+                    asu_collection=self.asu_collection,
+                    grid_size=tuple(grid_shape),
+                    tv_weight=getattr(parser, 'tv_weight', 0.0),
+                    positivity_weight=getattr(parser, 'positivity_weight', 0.0),
+                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.0)
                 )
-                prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
+                prior = JointPrior(wilson_prior=prior, sparse_prior=dense_prior)
 
-            # Use Joint Model class
             model = JointVariationalMergingModel(
                 surrogate_posterior, prior, likelihood, scaling_model, 
                 parser.mc_samples, kl_weight=parser.kl_weight
             )
 
-        # 4. Handle Standard Modes
+            # 3. Optimizer: Custom Keras pSGLD
+            lr_schedule = tfk.optimizers.schedules.ExponentialDecay(
+                parser.learning_rate,
+                decay_steps=parser.iterations // 4,
+                decay_rate=0.5,
+                staircase=True
+            )
+            
+            # Use local pSGLD class instead of TFP
+            opt = pSGLD(
+                learning_rate=lr_schedule,
+                precondition_decay=0.95,
+                name="pSGLD"
+            )
+            
+            model.compile(opt, run_eagerly=parser.run_eagerly)
+            return model
+
+
+        # === B. Variational Inference (VI) ===
+        elif self.is_complex:
+            from careless.models.merging.surrogate_posteriors import ComplexCartesianFlow, RealSpaceGridFlow
+            from careless.models.priors.base import JointPrior
+            from careless.models.priors.empirical import SparseRealSpacePrior
+            from careless.models.merging.variational import JointVariationalMergingModel
+
+            print("Initializing Complex VI Model...")
+
+            if surrogate_posterior is None:
+                if getattr(parser, 'surrogate_posterior', '') == 'real_space_grid_flow':
+                    if grid_shape is None:
+                        raise ValueError("RealSpaceGridFlow requires grid shape.")
+                    
+                    hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
+                    
+                    surrogate_posterior = RealSpaceGridFlow(
+                        miller_indices=hkls,
+                        grid_shape=tuple(grid_shape),
+                        depth=parser.flow_depth,
+                        filters=getattr(parser, 'cnn_filters', 32),
+                        inference_samples=parser.flow_inference_samples,
+                        name='structure_factor'
+                    )
+                else:
+                    base_loc = prior.mean()
+                    base_scale = tf.sqrt(prior.stddev() / 2.0)
+                    
+                    surrogate_posterior = ComplexCartesianFlow(
+                        loc=base_loc,
+                        scale=base_scale,
+                        depth=parser.flow_depth,
+                        hidden_units=parser.flow_hidden_units,
+                        inference_samples=parser.flow_inference_samples,
+                        name='structure_factor'
+                    )
+
+            if not isinstance(prior, JointPrior):
+                hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
+                sparse_prior = SparseRealSpacePrior(
+                    miller_indices=hkls,
+                    n_points=getattr(parser, 'stochastic_points', 4096),
+                    positivity_weight=getattr(parser, 'positivity_weight', 1.0),
+                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
+                    tv_weight=getattr(parser, 'tv_weight', 0.0)
+                )
+                prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
+
+            model = JointVariationalMergingModel(
+                surrogate_posterior, prior, likelihood, scaling_model, 
+                parser.mc_samples, kl_weight=parser.kl_weight
+            )
+
         else:
+            # Standard Real Mode
             if surrogate_posterior is None:
                 loc, scale = prior.mean(), prior.stddev()
                 scale = scale * parser.structure_factor_init_scale
@@ -563,7 +652,6 @@ class DataManager():
                 parser.mc_samples, kl_weight=parser.kl_weight
             )
 
-        # 5. Compile
         opt = tfk.optimizers.Adam(
             parser.learning_rate,
             parser.beta_1,

@@ -3,6 +3,7 @@ from tensorflow_probability import distributions as tfd
 import numpy as np
 from careless.models.priors.base import Prior
 from careless.models.merging.surrogate_posteriors import RiceWoolfson
+from careless.utils.density import build_symmetry_map_gemmi, probed_ifft
 import math
 
 
@@ -211,3 +212,91 @@ class SparseRealSpacePrior(Prior):
             total_log_prob -= self.tv_weight * tv_loss
 
         return total_log_prob
+
+class DenseRealSpacePrior(Prior):
+    """
+    Applies Real-Space constraints (TV, Positivity, Sparsity) by expanding
+    ASU coefficients to a P1 grid and performing a dense 3D FFT.
+    """
+    def __init__(self, asu_collection, grid_size, tv_weight=0.0, positivity_weight=0.0, sparsity_weight=0.0):
+        super().__init__()
+        self.tv_weight = tv_weight
+        self.positivity_weight = positivity_weight
+        self.sparsity_weight = sparsity_weight
+        self.grid_size = grid_size # (nz, ny, nx)
+        self.nx, self.ny, self.nz = grid_size
+        self.nz_half = self.nz // 2 + 1
+
+        # 1. Build Symmetry Expansion Map (Reuse existing logic)
+        # Note: We take the first ASU from the collection. Assumes merged dataset logic.
+        sg_symbol = asu_collection.reciprocal_asus[0].spacegroup.hm
+        cell = asu_collection.reciprocal_asus[0].cell
+
+        gather_ids, phase_shifts, conj_flags, n_unique = build_symmetry_map_gemmi(
+            cell, sg_symbol, (self.nx, self.ny, self.nz_half)
+        )
+
+        self.asu_to_grid_indices = tf.constant(gather_ids, dtype=tf.int32)
+        self.asu_phase_shifts = tf.constant(phase_shifts, dtype=tf.complex64)
+        self.asu_conj_flags = tf.constant(conj_flags, dtype=tf.bool)
+
+    def _expand_to_full(self, F_flat_state, batch_size):
+        # Reshape to Half-Grid
+        F_half = tf.reshape(F_flat_state, (batch_size, self.nx, self.ny, self.nz_half))
+        limit = -1 if (self.nz % 2 == 0) else None
+
+        # Hermitian Symmetry Expansion for Real Output
+        middle_slice = F_half[..., 1:limit]
+        rev_slice = tf.reverse(middle_slice, axis=[1, 2, 3])
+        rev_slice = tf.roll(rev_slice, shift=[1, 1, 0], axis=[1, 2, 3])
+        redundant_part = tf.math.conj(rev_slice)
+
+        return tf.concat([F_half, redundant_part], axis=-1)
+
+    def log_prob(self, z_complex):
+        """
+        z_complex: (Batch, N_asu)
+        """
+        batch_size = tf.shape(z_complex)[0]
+
+        # 1. Expand ASU -> Half Grid
+        # Gather (Batch, Grid_Flat) from (Batch, ASU)
+        F_gathered = tf.gather(z_complex, self.asu_to_grid_indices, axis=1)
+        F_expanded = tf.where(self.asu_conj_flags, tf.math.conj(F_gathered), F_gathered)
+        F_grid_flat = F_expanded * self.asu_phase_shifts
+
+        # 2. Expand Half Grid -> Full Grid
+        F_full = self._expand_to_full(F_grid_flat, batch_size)
+
+        # 3. IFFT to Real Space Density
+        # We use the custom gradient 'probed_ifft' for safety, or standard ifft3d
+        rho_complex = probed_ifft(F_full)
+
+        # Scaling (Matches TF's 1/N normalization in IFFT)
+        total_grid_points = tf.cast(self.nx * self.ny * self.nz, tf.float32)
+        rho = tf.math.real(rho_complex) * total_grid_points
+
+        # 4. Calculate Constraints (Negative Log Prob = Loss)
+        prior_log_prob = 0.0
+
+        # A. Sparsity (L1)
+        if self.sparsity_weight > 0:
+            l1_loss = tf.reduce_mean(tf.abs(rho), axis=[1,2,3])
+            prior_log_prob -= self.sparsity_weight * l1_loss
+
+        # B. Positivity (ReLU)
+        if self.positivity_weight > 0:
+            pos_loss = tf.reduce_mean(tf.square(tf.nn.relu(-rho)), axis=[1,2,3])
+            prior_log_prob -= self.positivity_weight * pos_loss
+
+        # C. Total Variation (Anisotropic suppression)
+        if self.tv_weight > 0:
+            eps = 1e-6
+            dx = rho - tf.roll(rho, shift=1, axis=1)
+            dy = rho - tf.roll(rho, shift=1, axis=2)
+            dz = rho - tf.roll(rho, shift=1, axis=3)
+            grad_mag = tf.sqrt(tf.square(dx) + tf.square(dy) + tf.square(dz) + eps)
+            tv_loss = tf.reduce_mean(grad_mag, axis=[1,2,3])
+            prior_log_prob -= self.tv_weight * tv_loss
+
+        return prior_log_prob
