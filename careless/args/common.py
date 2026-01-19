@@ -97,4 +97,11 @@ args_and_kwargs = (
         "type": int,
         "default": 16,
     }),
+    (("--mixing-rank",), {
+        "help": "Rank of flow covariance matrix. Should be proportional to the number "
+                "of atoms in the asymmetric unit. "
+                "Default: estimate from unit cell volume",
+        "type": int,
+        "default": None,
+    })
 )

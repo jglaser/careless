@@ -511,27 +511,30 @@ class DataManager():
 
         if surrogate_posterior is None:
             if getattr(parser, 'surrogate_posterior', '') == 'complex_flow':
-                # --- 1. Calculate Physical Rank (Stieltjes Prior) ---
-                # Get Volume of ASU
-                cell = self.asu_collection.reciprocal_asus[0].cell
-                sg = self.asu_collection.reciprocal_asus[0].spacegroup
-                n_ops = len(sg.operations())
-                vol_asu = cell.volume / n_ops
+                mixing_rank = getattr(parser, 'mixing_rank', None)
 
-                # Estimate Atoms (Approx 10 A^3 per atom for dense packing)
-                # or ~18-20 A^3 per non-H atom.
-                # For neutrons (H included), ~10 A^3 is safer.
-                est_atoms_asu = int(vol_asu / 10.0)
+                if mixing_rank is None:
+                    # --- 1. Calculate Physical Rank (Stieltjes Prior) ---
+                    # Get Volume of ASU
+                    cell = self.asu_collection.reciprocal_asus[0].cell
+                    sg = self.asu_collection.reciprocal_asus[0].spacegroup
+                    n_ops = len(sg.operations())
+                    vol_asu = cell.volume / n_ops
 
-                # Clamp Rank
-                # Must be at least 2, and no larger than N_refls (Full Rank)
-                # We typically want Rank < N_refls / 2 to force compression
-                n_refls = len(prior.mean())
-                mixing_rank = max(4, min(est_atoms_asu, n_refls // 2))
+                    # Estimate Atoms (Approx 10 A^3 per atom for dense packing)
+                    # or ~18-20 A^3 per non-H atom.
+                    # For neutrons (H included), ~10 A^3 is safer.
+                    est_atoms_asu = int(vol_asu / 10.0)
 
-                print(f"[Stieltjes Prior] ASU Volume: {vol_asu:.1f} A^3")
-                print(f"[Stieltjes Prior] Est. Independent Atoms: {est_atoms_asu}")
-                print(f"[Stieltjes Prior] Setting Flow Mixing Rank = {mixing_rank}")
+                    # Clamp Rank
+                    # Must be at least 2, and no larger than N_refls (Full Rank)
+                    # We typically want Rank < N_refls / 2 to force compression
+                    n_refls = len(prior.mean())
+                    mixing_rank = max(4, min(est_atoms_asu, n_refls // 2))
+
+                    print(f"[Stieltjes Prior] ASU Volume: {vol_asu:.1f} A^3")
+                    print(f"[Stieltjes Prior] Est. Independent Atoms: {est_atoms_asu}")
+                    print(f"[Stieltjes Prior] Setting Flow Mixing Rank = {mixing_rank}")
 
                 base_loc = prior.mean()
                 base_scale = tf.sqrt(prior.stddev() / 2.0)
@@ -542,7 +545,7 @@ class DataManager():
                     depth=parser.flow_depth,
                     hidden_units=parser.flow_hidden_units,
                     inference_samples=parser.flow_inference_samples,
-                    mixing_rank=mixing_rank, # <--- Pass it here
+                    mixing_rank=mixing_rank,
                     name='structure_factor'
                 )
 
