@@ -29,7 +29,7 @@ class DataManager():
         self.is_complex = False
         if self.parser is not None:
             if hasattr(self.parser, 'surrogate_posterior'):
-                if self.parser.surrogate_posterior == 'complex_flow':
+                if self.parser.surrogate_posterior == 'dual_flow':
                     self.is_complex = True
 
     @classmethod
@@ -502,66 +502,52 @@ class DataManager():
 
         # 3. Handle Complex Flow / Joint Prior Mode
         if self.is_complex:
-            from careless.models.merging.surrogate_posteriors import ComplexCartesianFlow
+            from careless.models.merging.surrogate_posteriors import DualDomainFlow
             from careless.models.priors.base import JointPrior
             from careless.models.priors.empirical import SparseRealSpacePrior
             from careless.models.merging.variational import JointVariationalMergingModel
 
-            print("Initializing Complex Cartesian Flow and Joint Prior...")
+            print("Initializing Dual Domain Flow and Joint Prior...")
 
-        if surrogate_posterior is None:
-            if getattr(parser, 'surrogate_posterior', '') == 'complex_flow':
-                # --- 1. Calculate Physical Rank (Stieltjes Prior) ---
-                # Get Volume of ASU
-                cell = self.asu_collection.reciprocal_asus[0].cell
-                sg = self.asu_collection.reciprocal_asus[0].spacegroup
-                n_ops = len(sg.operations())
-                vol_asu = cell.volume / n_ops
-
-                # Estimate Atoms (Approx 10 A^3 per atom for dense packing)
-                # or ~18-20 A^3 per non-H atom.
-                # For neutrons (H included), ~10 A^3 is safer.
-                est_atoms_asu = int(vol_asu / 10.0)
-
-                # Clamp Rank
-                # Must be at least 2, and no larger than N_refls (Full Rank)
-                # We typically want Rank < N_refls / 2 to force compression
-                n_refls = len(prior.mean())
-                mixing_rank = max(4, min(est_atoms_asu, n_refls // 2))
-
-                print(f"[Stieltjes Prior] ASU Volume: {vol_asu:.1f} A^3")
-                print(f"[Stieltjes Prior] Est. Independent Atoms: {est_atoms_asu}")
-                print(f"[Stieltjes Prior] Setting Flow Mixing Rank = {mixing_rank}")
-
-                base_loc = prior.mean()
-                base_scale = tf.sqrt(prior.stddev() / 2.0)
-
-                surrogate_posterior = ComplexCartesianFlow(
-                    loc=base_loc,
-                    scale=base_scale,
-                    depth=parser.flow_depth,
-                    hidden_units=parser.flow_hidden_units,
-                    inference_samples=parser.flow_inference_samples,
-                    mixing_rank=mixing_rank, # <--- Pass it here
-                    name='structure_factor'
-                )
-
-            if not isinstance(prior, JointPrior):
-                # Retrieve HKLs via lookup_table (fix for AttributeError)
+            if surrogate_posterior is None:
                 hkls = self.asu_collection.reciprocal_asus[0].lookup_table.get_hkls()
-                sparse_prior = SparseRealSpacePrior(
-                    miller_indices=hkls,
-                    positivity_weight=getattr(parser, 'positivity_weight', 1.0),
-                    sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
-                    tv_weight=getattr(parser, 'tv_weight', 0.05),
-                )
-                prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
 
-            # Use Joint Model class
-            model = JointVariationalMergingModel(
-                surrogate_posterior, prior, likelihood, scaling_model, 
-                parser.mc_samples, kl_weight=parser.kl_weight
-            )
+                if getattr(parser, 'surrogate_posterior', '') == 'dual_flow':
+                    grid_shape = getattr(parser, 'grid_shape', None)
+
+                    d_min = self.asu_collection.dHKL.min()
+                    cell = self.asu_collection.reciprocal_asus[0].cell
+                    target_spacing = d_min / 2.0
+                    nx = int(cell.a / target_spacing)
+                    ny = int(cell.b / target_spacing)
+                    nz = int(cell.c / target_spacing)
+                    grid_shape = (nx, ny, nz)
+                    print(f"Auto-detected FFT Grid Shape for d_min={d_min:.2f}A: {grid_shape}")
+
+                    surrogate_posterior = DualDomainFlow(
+                        miller_indices=hkls,
+                        grid_shape=grid_shape,
+                        depth=parser.flow_depth,
+                        filters=parser.flow_hidden_units,
+                        inference_samples=parser.flow_inference_samples,
+                        name='structure_factor'
+                    )
+
+                if not isinstance(prior, JointPrior):
+                    # Retrieve HKLs via lookup_table (fix for AttributeError)
+                    sparse_prior = SparseRealSpacePrior(
+                        miller_indices=hkls,
+                        positivity_weight=getattr(parser, 'positivity_weight', 1.0),
+                        sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
+                        tv_weight=getattr(parser, 'tv_weight', 0.05),
+                    )
+                    prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
+
+                # Use Joint Model class
+                model = JointVariationalMergingModel(
+                    surrogate_posterior, prior, likelihood, scaling_model, 
+                    parser.mc_samples, kl_weight=parser.kl_weight
+                )
 
         # 4. Handle Standard Modes
         else:

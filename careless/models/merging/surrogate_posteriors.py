@@ -455,3 +455,204 @@ class ComplexCartesianFlow(SurrogatePosterior):
     def moment_4_intensity(self):
         z = self.sample(self.inference_samples)
         return tf.reduce_mean(tf.pow(tf.abs(z), 4), axis=0)
+
+
+    def call(self, x):
+        return self.net(x)
+
+# --- HELPER: SAFE COMPLEX NORM ---
+def safe_abs(z, eps=1e-6):
+    """ Computes abs(z) with epsilon shielding to prevent NaN gradients at z=0. """
+    z_real = tf.math.real(z)
+    z_imag = tf.math.imag(z)
+    return tf.sqrt(tf.square(z_real) + tf.square(z_imag) + eps)
+
+# --- GLOBAL LAYERS ---
+
+class CNN3D(tf.keras.layers.Layer):
+    """ Simple 3D CNN for Coupling Layers. Defined globally to be visible to all Flows. """
+    def __init__(self, filters=32, kernel_size=3, layers=2, name='cnn3d'):
+        super().__init__(name=name)
+        self.net = tf.keras.Sequential()
+        for _ in range(layers):
+            self.net.add(tf.keras.layers.Conv3D(filters, kernel_size, padding='same', activation='relu'))
+        self.net.add(tf.keras.layers.Conv3D(2, kernel_size=1, padding='same', kernel_initializer='zeros'))
+
+    def call(self, x):
+        return self.net(x)
+
+class ComplexToReal(tfb.Bijector):
+    """ Adapts Complex tensor (..., N) -> Real tensor (..., N, 2) """
+    def __init__(self, name="complex_to_real"):
+        super().__init__(forward_min_event_ndims=0, name=name)
+
+    def _forward(self, x):
+        return tf.stack([tf.math.real(x), tf.math.imag(x)], axis=-1)
+
+    def _inverse(self, y):
+        return tf.complex(y[..., 0], y[..., 1])
+
+    def _forward_log_det_jacobian(self, x):
+        return tf.constant(0., dtype=x.dtype.real_dtype)
+
+    def _inverse_log_det_jacobian(self, y):
+        return tf.constant(0., dtype=y.dtype)
+
+class FFT3DBijector(tfb.Bijector):
+    """
+    Bijector wrapper for 3D FFT.
+    Assumes Ortho-normalization to preserve volume (Jacobian=0).
+    Robust implementation to avoid complex division gradients by explicit casting.
+    """
+    def __init__(self, name="fft3d"):
+        super().__init__(forward_min_event_ndims=3, name=name)
+
+    def _forward(self, x):
+        # x is Complex Grid
+        dims = tf.cast(tf.reduce_prod(tf.shape(x)[-3:]), x.dtype.real_dtype)
+        # Use rsqrt(dims) + 0j to be absolutely explicit about complex scaling
+        scale = tf.math.rsqrt(dims)
+        scale_c = tf.complex(scale, tf.zeros_like(scale))
+        return tf.signal.fft3d(x) * scale_c
+
+    def _inverse(self, y):
+        # y is Complex Grid
+        dims = tf.cast(tf.reduce_prod(tf.shape(y)[-3:]), y.dtype.real_dtype)
+        # Invert scale: sqrt(dims)
+        scale = tf.math.sqrt(dims)
+        scale_c = tf.complex(scale, tf.zeros_like(scale))
+        # ifft is usually scaled by 1/N. We need * sqrt(N) to match ortho.
+        # tf.signal.ifft3d is scaled by 1/N.
+        # We need (ifft(y) * N) / sqrt(N) = ifft(y) * sqrt(N).
+        # Actually, to invert _forward:
+        # y = fft(x) / sqrt(N).
+        # x = ifft(y * sqrt(N)) * N ? No.
+        # x = ifft(y) * sqrt(N) is correct if fft/ifft pair is 1/N.
+        return tf.signal.ifft3d(y) * scale_c
+
+    def _forward_log_det_jacobian(self, x):
+        return tf.constant(0., dtype=x.dtype.real_dtype)
+
+class DualDomainFlow(SurrogatePosterior):
+    """
+    A Self-Dual RealNVP Flow ("The Sandwich").
+    z_real -> [RealNVP w/ CNN] -> [FFT] -> [RecipNVP w/ CNN] -> F_grid
+    Uses caching strategy to handle projection to observed reflections.
+    """
+    def __init__(self, miller_indices, grid_shape, depth=2, filters=16,
+                 inference_samples=1, name='DualDomainFlow', **kwargs):
+        super().__init__(distribution=None, name=name, **kwargs)
+
+        self.miller_indices = tf.cast(miller_indices, tf.int32)
+        self.grid_shape = grid_shape
+        self.inference_samples = inference_samples
+        self.flat_dim = np.prod(grid_shape) * 2 # Re+Im
+        self.networks = []
+
+        self.base_dist = tfd.MultivariateNormalDiag(
+            loc=tf.zeros(self.flat_dim),
+            scale_diag=tf.ones(self.flat_dim)
+        )
+
+        bijectors = []
+
+        # --- STAGE A: REAL SPACE FLOW ---
+        bijectors.append(tfb.Reshape(event_shape_out=grid_shape + (2,), event_shape_in=[self.flat_dim]))
+
+        for i in range(depth):
+            cnn = CNN3D(filters=filters, name=f'real_cnn_{i}')
+            self.networks.append(cnn)
+            fn = self._make_shift_and_log_scale_fn(cnn)
+
+            bijectors.append(tfb.RealNVP(
+                num_masked=1,
+                shift_and_log_scale_fn=fn
+            ))
+            bijectors.append(tfb.Permute(permutation=[1, 0]))
+
+        # --- STAGE B: THE EXCHANGE ---
+        bijectors.append(tfb.Invert(ComplexToReal()))
+        bijectors.append(FFT3DBijector())
+        bijectors.append(ComplexToReal())
+
+        # --- STAGE C: RECIPROCAL SPACE FLOW ---
+        for i in range(depth):
+            cnn = CNN3D(filters=filters, name=f'recip_cnn_{i}')
+            self.networks.append(cnn)
+            fn = self._make_shift_and_log_scale_fn(cnn)
+
+            bijectors.append(tfb.RealNVP(
+                num_masked=1,
+                shift_and_log_scale_fn=fn
+            ))
+            bijectors.append(tfb.Permute(permutation=[1, 0]))
+
+        bijectors.append(tfb.Reshape(event_shape_out=[self.flat_dim], event_shape_in=grid_shape + (2,)))
+
+        self.flow = tfb.Chain(list(reversed(bijectors)))
+        self.distribution = tfd.TransformedDistribution(self.base_dist, self.flow)
+        self._last_log_prob = None
+
+    def _make_shift_and_log_scale_fn(self, network):
+        def shift_and_log_scale_fn(x, output_units):
+            out = network(x)
+            shift, log_scale = tf.split(out, 2, axis=-1)
+            # Clamp log_scale to prevent explosion/collapse
+            log_scale = 2.0 * tf.tanh(log_scale)
+            return shift, log_scale
+        return shift_and_log_scale_fn
+
+    def sample(self, n_samples=None):
+        if n_samples is None: n_samples = self.inference_samples
+
+        # 1. Sample Grid and Cache log_prob
+        flat_output = self.distribution.sample(n_samples)
+        self._last_log_prob = self.distribution.log_prob(flat_output)
+
+        # 2. Reshape to Grid
+        grid_output = tf.reshape(flat_output, (n_samples, *self.grid_shape, 2))
+
+        # 3. Convert to Complex Structure Factors
+        F_grid = tf.complex(grid_output[..., 0], grid_output[..., 1])
+
+        # 4. Gather Observed Reflections
+        gathered_Fs = []
+        for i in range(n_samples):
+             f_sample = tf.gather_nd(F_grid[i], self.miller_indices)
+             gathered_Fs.append(f_sample)
+        z_complex = tf.stack(gathered_Fs)
+
+        # Shield downstream likelihood from exact zero
+        eps = 1e-6
+        z_complex = z_complex + tf.complex(eps, eps)
+
+        return z_complex
+
+    def log_prob(self, z_complex):
+        # Return cached log_prob of the Grid (Latent)
+        if self._last_log_prob is None:
+             raise RuntimeError("DualDomainFlow.sample() must be called before log_prob().")
+        return self._last_log_prob
+
+    @property
+    def parameters(self):
+        return {}
+
+    def parameter_properties(self, dtype=tf.float32, num_classes=None):
+        return {}
+
+    def mean(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(z, axis=0)
+
+    def stddev(self):
+        z = self.sample(self.inference_samples)
+        return tf.math.reduce_std(safe_abs(z), axis=0)
+
+    def mean_intensity(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(tf.square(safe_abs(z)), axis=0)
+
+    def moment_4_intensity(self):
+        z = self.sample(self.inference_samples)
+        return tf.reduce_mean(tf.pow(safe_abs(z), 4), axis=0)

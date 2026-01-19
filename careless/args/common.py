@@ -63,7 +63,7 @@ args_and_kwargs = (
                 "'flow' uses a Normalizing Flow to capture correlations and non-Gaussian shapes. Default: 'truncated_normal'",
         "type": str,
         "default": "truncated_normal",
-        "choices": ["truncated_normal", "flow", "complex_flow"]
+        "choices": ["truncated_normal", "flow", "dual_flow"]
     }),
 
     (("--flow-depth",), {
@@ -96,5 +96,13 @@ args_and_kwargs = (
                 "Default: 16",
         "type": int,
         "default": 16,
+    }),
+    (("--grid-shape",), {
+        "help": "Dimensions of the real-space density grid (nz, ny, nx) for RealSpaceGridFlow or SGLD. "
+                "If not provided, it is auto-detected from d_min (Nyquist).",
+        "type": int,
+        "nargs": 3,
+        "metavar": ('NZ', 'NY', 'NX'),
+        "default": None,
     }),
 )
