@@ -554,6 +554,7 @@ class DataManager():
                     positivity_weight=getattr(parser, 'positivity_weight', 1.0),
                     sparsity_weight=getattr(parser, 'sparsity_weight', 0.1),
                     tv_weight=getattr(parser, 'tv_weight', 0.05),
+                    entropy_weight=getattr(parser, 'entropy_weight', 0.0),
                 )
                 prior = JointPrior(wilson_prior=prior, sparse_prior=sparse_prior)
 

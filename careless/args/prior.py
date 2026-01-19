@@ -85,5 +85,14 @@ args_and_kwargs = (
                 "type": float,
                 "default": 0.05,
             },
-        ),
-    )
+    ),
+    (
+        ("--entropy-weight",),
+        {
+            "help": "Weight for the Maximum Entropy constraint (S = -rho*ln(rho)) "
+            "to enforce atomic parsimony and reduce noise. Default is 0.0.",
+            "type": float,
+            "default": 0.0,
+        },
+    ),
+)

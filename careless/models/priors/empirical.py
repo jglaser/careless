@@ -132,15 +132,17 @@ class RiceWoolfsonReferencePrior(ReferencePrior):
 
 class SparseRealSpacePrior(Prior):
     """
-    Applies real-space constraints (Positivity, Sparsity, Total Variation)
+    Applies real-space constraints (Positivity, Sparsity, Total Variation, Entropy)
     using Stochastic Non-Uniform DFT.
     """
-    def __init__(self, miller_indices, n_points=4096, positivity_weight=1.0, sparsity_weight=0.0, tv_weight=0.0):
+    def __init__(self, miller_indices, n_points=4096, positivity_weight=1.0, sparsity_weight=0.0, tv_weight=0.0, entropy_weight=0.0):
         """
         miller_indices : array-like (N, 3)
             Miller indices corresponding to the unique structure factors.
         tv_weight : float
             Weight for Total Variation regularization (penalizes density gradients).
+        entropy_weight : float
+            Weight for Maximum Entropy regularization (penalizes low entropy states).
         """
         super().__init__()
         self.hkls = tf.cast(miller_indices, tf.float32)
@@ -148,9 +150,9 @@ class SparseRealSpacePrior(Prior):
         self.positivity_weight = positivity_weight
         self.sparsity_weight = sparsity_weight
         self.tv_weight = tv_weight
+        self.entropy_weight = entropy_weight
 
         # Precompute gradient factors for TV: -2*pi*i * (h,k,l)
-        # Shape: (N_refls, 3). We use complex64 for the multiplication.
         if self.tv_weight > 0:
             self.grad_factors = tf.cast(self.hkls, tf.complex64) * tf.complex(0., -2.0 * np.pi)
 
@@ -159,16 +161,13 @@ class SparseRealSpacePrior(Prior):
         z_complex: Tensor (Batch, N_refls) of complex structure factors.
         """
         # 1. Sample random fractional coordinates r in [0, 1]
-        # Shape: (N_points, 3)
         r_frac = tf.random.uniform((self.n_points, 3), dtype=tf.float32)
 
-        # 2. Compute Phase Shifts: theta = -2*pi * (r . h)
-        # (N_points, 3) @ (3, N_refls) -> (N_points, N_refls)
+        # 2. Compute Phase Shifts
         theta = -2.0 * np.pi * tf.matmul(r_frac, self.hkls, transpose_b=True)
         exp_theta = tf.exp(tf.complex(0.0, theta))
 
         # 3. Compute Density: rho(r)
-        # (Batch, N_refls) @ (N_refls, N_points) -> (Batch, N_points)
         rho = 2.0 * tf.math.real(tf.matmul(z_complex, exp_theta, transpose_b=True))
 
         total_log_prob = 0.0
@@ -186,28 +185,24 @@ class SparseRealSpacePrior(Prior):
 
         # --- C. Total Variation (Gradient L1) ---
         if self.tv_weight > 0:
-            # We need to compute Sum [ F_h * (-2pi i h) * exp(...) ]
-            # Broadcast z_complex against the 3 gradient dimensions (h,k,l)
-            # z_complex: (Batch, N_refls)
-            # grad_factors: (N_refls, 3)
-            # z_grad: (Batch, N_refls, 3)
             z_grad = tf.expand_dims(z_complex, -1) * tf.expand_dims(self.grad_factors, 0)
-
-            # Perform DFT for the vector field (3 components)
-            # Einsum:
-            #   b=batch, r=reflections, d=xyz_dim, p=points
-            #   input (b,r,d) and (p,r) [transpose of exp_theta] -> output (b,p,d)
             grad_field_complex = tf.einsum('brd,pr->bpd', z_grad, exp_theta)
-
-            # Real space gradient vector field
             grad_field = 2.0 * tf.math.real(grad_field_complex)
-
-            # Compute magnitude of gradient at each point: sqrt(dx^2 + dy^2 + dz^2)
             grad_norm = tf.norm(grad_field, axis=-1)
-
-            # Average over points (Monte Carlo integral of |Grad(rho)|)
             tv_loss = tf.reduce_mean(grad_norm, axis=1)
-
             total_log_prob -= self.tv_weight * tv_loss
+
+        # --- D. Two-Channel Maximum Entropy (Neutron Safe) ---
+        if self.entropy_weight > 0:
+            # 1e-12 ensures gradients don't explode at 0
+            rho_plus = tf.nn.relu(rho) + 1e-12
+            rho_minus = tf.nn.relu(-rho) + 1e-12
+
+            # S = -p*ln(p)
+            s_plus = -rho_plus * tf.math.log(rho_plus)
+            s_minus = -rho_minus * tf.math.log(rho_minus)
+
+            # We add S because we want to MAXIMIZE entropy (log_prob ~ Energy ~ -(-S))
+            total_log_prob += self.entropy_weight * tf.reduce_mean(s_plus + s_minus, axis=1)
 
         return total_log_prob
