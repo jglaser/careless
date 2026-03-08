@@ -227,17 +227,22 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         """
         Alternative to the keras backed VariationalMergingModel.fit method. This method is much faster at the moment but less flexible.
         """
+        steps_per_execution = 100 # or 50, or 100
+
         if use_custom_train_step:
             def train_step(model_and_data):
                 model, data = model_and_data
                 model.reset_metrics()
-                history = model.train_step_with_gradient_norm((data,))
+                # Run multiple steps on the GPU before returning
+                for _ in tf.range(steps_per_execution):
+                    history = model.train_step_with_gradient_norm((data,))
                 return history
         else:
             def train_step(model_and_data):
                 model, data = model_and_data
                 model.reset_metrics()
-                history = model.train_step((data,))
+                for _ in tf.range(steps_per_execution):
+                    history = model.train_step((data,))
                 return history
 
         if not self._run_eagerly:
