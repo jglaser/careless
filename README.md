@@ -6,6 +6,7 @@ Merging crystallography data without much physics.
 [![codecov](https://codecov.io/gh/rs-station/careless/branch/main/graph/badge.svg)](https://codecov.io/gh/rs-station/careless)
 [![PyPI](https://img.shields.io/pypi/v/careless?color=blue)](https://pypi.org/project/careless/)
 [![DOI](http://img.shields.io/badge/bioRxiv-10.1101/2021.01.05.425510-BD2736.svg)](https://doi.org/10.1101/2021.01.05.425510)
+[![Forum](http://img.shields.io/badge/Get-Help-purple)](https://discourse.rs-station.org/c/software/careless/6)
 
 ## Installation
 As described in the [TensorFlow docs](https://www.tensorflow.org/install/pip#step-by-step_instructions), it is best practice to install `careless` in a fresh [anaconda](https://www.anaconda.com/products/distribution) environment to avoid conflicts with previously installed dependencies. 
