@@ -290,10 +290,7 @@ class SplineNet(tf.keras.layers.Layer):
             self.conv_out = tf.keras.layers.Conv1D(bins, kernel_size=1, kernel_initializer='zeros')
 
         # Global Mixing
-        self.use_global = False
-        if n_refls is not None and n_refls < 20000:
-            self.use_global = True
-            
+        if n_refls is not None:
             # --- FIX: Use Physical Rank if provided, else heuristic ---
             if mixing_rank is not None:
                 rank = mixing_rank
@@ -314,21 +311,21 @@ class SplineNet(tf.keras.layers.Layer):
         x = self.conv2(x)
 
         # 2. Low-Rank Global Mixing
-        if self.use_global:
-            # Transpose to (Batch, Channels, N_refls) so Dense acts on reflections
-            x_T = tf.transpose(x, perm=[0, 2, 1])
 
-            # Factorized Dense: x @ U @ V
-            # U reduces dim to 'rank', V expands back to 'N_refls'
-            # Initialize V with zeros -> Identity map at start -> No bias
-            x_low = self.mix_U(x_T)
-            x_global = self.mix_V(x_low)
+        # Transpose to (Batch, Channels, N_refls) so Dense acts on reflections
+        x_T = tf.transpose(x, perm=[0, 2, 1])
 
-            # Transpose back
-            x_global = tf.transpose(x_global, perm=[0, 2, 1])
+        # Factorized Dense: x @ U @ V
+        # U reduces dim to 'rank', V expands back to 'N_refls'
+        # Initialize V with zeros -> Identity map at start -> No bias
+        x_low = self.mix_U(x_T)
+        x_global = self.mix_V(x_low)
 
-            # Residual connection with norm
-            x = self.ln(x + x_global)
+        # Transpose back
+        x_global = tf.transpose(x_global, perm=[0, 2, 1])
+
+        # Residual connection with norm
+        x = self.ln(x + x_global)
 
         logits = self.conv_out(x)
 
@@ -361,11 +358,7 @@ class ComplexCartesianFlow(SurrogatePosterior):
         self.inference_samples = inference_samples
 
         # Diagnostic: Check correlation complexity
-        use_global = self.n_refls < 20000
-        if use_global:
-            print(f"\n[Global Mixing] Dense Triangular Map ENABLED for {self.n_refls} reflections.")
-        else:
-            print(f"\n[Global Mixing] DISABLED (N={self.n_refls} > 20000). Using Independent Flow.\n")
+        print(f"\n[Global Mixing] Dense Triangular Map ENABLED for {self.n_refls} reflections.")
 
         # 4-Component Mixture Base
         n_components = 4
