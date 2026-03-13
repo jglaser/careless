@@ -150,8 +150,14 @@ class VariationalMergingModel(tfk.models.Model, BaseModel):
         try:
             kl_div = posterior.kl_divergence(prior)
         except:
-            NotImplementedError
-            kl_div = posterior.log_prob(samples) - prior.log_prob(samples)
+            q_log_prob = posterior.log_prob(samples)
+            p_log_prob = prior.log_prob(samples)
+            
+            # If the posterior evaluates a joint distribution but prior returns marginals
+            if len(q_log_prob.shape) < len(p_log_prob.shape):
+                p_log_prob = tf.reduce_sum(p_log_prob, axis=-1)
+                
+            kl_div = q_log_prob - p_log_prob
 
         if reduction == 'sum':
             kl_div = tf.reduce_sum(kl_div) / self.mc_sample_size
