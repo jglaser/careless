@@ -20,6 +20,8 @@ def run_careless(parser):
     from careless.models.merging.variational import VariationalMergingModel
     from careless.models.scaling.image import HybridImageScaler,ImageScaler
     from careless.models.scaling.nn import MLPScaler
+    from careless.models.priors.wilson import DoubleWilsonPrior # Ensure this is imported
+    from careless.models.merging.surrogate_posteriors import TruncatedNormal, FlowPosterior
 
     if parser.type == 'poly':
         df = LaueFormatter.from_parser(parser)
@@ -43,7 +45,58 @@ def run_careless(parser):
     else:
         train,test = dm.inputs,None
 
-    model = dm.build_model()
+    prior = None
+    parents = parser.parents
+    if parents is None:
+        prior = dm.get_wilson_prior(parser.wilson_prior_b)
+    else:
+        # Double Wilson Prior Logic
+        parents = [None if i == 'None' else int(i) for i in parents.split(',')]
+        r_values = parser.dwr
+        r_values = [float(i) for i in r_values.split(',')]
+
+        sigma = dm.get_wilson_sigma(parser.wilson_prior_b)
+        reindexing_ops = parser.reindexing_ops
+        if reindexing_ops is not None:
+            import gemmi
+            delim = ';'
+            reindexing_ops = [gemmi.Op(i) for i in reindexing_ops.split(delim)]
+
+        prior = DoubleWilsonPrior(
+            dm.asu_collection,
+            parents,
+            r_values,
+            reindexing_ops,
+            sigma=sigma,
+            optimize_r=parser.optimize_double_wilson_r
+        )
+
+    # Now loc and scale are available
+    loc, scale = prior.mean(), prior.stddev()
+    scale = scale * parser.structure_factor_init_scale
+
+    if parser.surrogate_posterior == 'flow':
+        # Use Flow Posterior
+        # Note: scale_shift logic from TruncatedNormal handled internally or via base_scale init
+        from careless.models.merging.surrogate_posteriors import FlowPosterior
+        surrogate_posterior = FlowPosterior.from_loc_and_scale(
+            loc,
+            scale,
+            depth=parser.flow_depth,
+            hidden_units=parser.flow_hidden_units,
+            inference_samples=parser.flow_inference_samples,
+            name='structure_factor'
+        )
+        print(f"Initialized FlowPosterior with depth={parser.flow_depth}, hidden_units={parser.flow_hidden_units}")
+    else:
+        # Default Truncated Normal
+        surrogate_posterior = TruncatedNormal.from_loc_and_scale(
+            loc,
+            scale,
+            name='structure_factor'
+        )
+
+    model = dm.build_model(surrogate_posterior=surrogate_posterior)
 
     if parser.scale_file is not None:
         model.scaling_model.load_weights(parser.scale_file)

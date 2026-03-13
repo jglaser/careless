@@ -4,6 +4,7 @@ import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 from tensorflow_probability.python.internal import tensor_util
+from tensorflow_probability.python.bijectors import masked_autoregressive_default_template
 import tensorflow as tf
 import tf_keras as tfk
 import numpy as np
@@ -171,5 +172,93 @@ class RiceWoolfson(tfd.Distribution):
     def prob(self, x):
         return tf.where(self._centric, self._woolfson.prob(x), self._rice.prob(x))
 
+class FlowPosterior(SurrogatePosterior):
+    """
+    A Surrogate Posterior parameterized by an Inverse Autoregressive Flow (IAF).
+    IAF allows for parallel sampling, which is critical for the speed of Variational Inference.
+    """
+    def __init__(self, loc, scale, depth=2, hidden_units=16, inference_samples=100, name='FlowPosterior', **kwargs):
+        """
+        Parameters
+        ----------
+        loc : array
+            Initial location parameter for the base distribution.
+        scale : array
+            Initial scale parameter for the base distribution.
+        depth : int
+            Number of autoregressive layers.
+        hidden_units : int
+            Width of the neural network in each layer.
+        """
+        n_dims = loc.shape[0]
 
+        # 1. Create variables LOCALLY first
+        base_loc = tf.Variable(loc, name='base_loc')
+        base_scale = tfp.util.TransformedVariable(scale, tfb.Softplus(), name='base_scale')
 
+        # 2. Build the Distribution
+        base_dist = tfd.MultivariateNormalDiag(loc=base_loc, scale_diag=base_scale)
+
+        bijectors = []
+        for i in range(depth):
+            # Standard MAF is slow for sampling (O(D)).
+            # Inverted MAF (IAF) is fast for sampling (O(1)).
+            maf = tfb.MaskedAutoregressiveFlow(
+                shift_and_log_scale_fn=masked_autoregressive_default_template(
+                    hidden_layers=[hidden_units, hidden_units]
+                )
+            )
+            bijectors.append(tfb.Invert(maf))
+
+            # Permute to mix dimensions (Permute is fast both ways)
+            bijectors.append(tfb.Permute(permutation=np.random.permutation(n_dims)))
+
+        # Enforce positivity
+        bijectors.append(tfb.Softplus())
+
+        chain = tfb.Chain(bijectors)
+        distribution = tfd.TransformedDistribution(distribution=base_dist, bijector=chain)
+
+        # 3. Initialize superclass
+        super().__init__(distribution, name=name, **kwargs)
+
+        # 4. Assign variables to self so Keras tracks them
+        self.base_loc = base_loc
+        self.base_scale = base_scale
+        self.inference_samples = inference_samples
+
+    @property
+    def parameters(self):
+        return {
+            'loc': self.base_loc,
+            'scale': self.base_scale
+        }
+
+    def parameter_properties(self, dtype=tf.float32, num_classes=None):
+        return {
+            'loc': tfp.util.ParameterProperties(),
+            'scale': tfp.util.ParameterProperties()
+        }
+
+    @tf.function
+    def mean(self, n_samples=None):
+        if n_samples is None:
+            n_samples = self.inference_samples
+        return tf.reduce_mean(self.distribution.sample(n_samples), axis=0)
+
+    @tf.function
+    def stddev(self, n_samples=None):
+        if n_samples is None:
+            n_samples = self.inference_samples
+        return tf.math.reduce_std(self.distribution.sample(n_samples), axis=0)
+
+    @tf.function
+    def moment_4(self, n_samples=None, **kwargs):
+        if n_samples is None:
+            n_samples = self.inference_samples
+        samples = self.distribution.sample(n_samples)
+        return tf.reduce_mean(tf.pow(samples, 4), axis=0)
+
+    @classmethod
+    def from_loc_and_scale(cls, loc, scale, depth=2, hidden_units=16, inference_samples=100, **kwargs):
+        return cls(loc, scale, depth=depth, hidden_units=hidden_units, inference_samples=inference_samples, **kwargs)
