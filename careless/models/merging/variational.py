@@ -348,16 +348,16 @@ class JointVariationalMergingModel(VariationalMergingModel):
         ll_sum = tf.reduce_sum(ll, axis=-1)
 
         # 6. Joint Prior Term
-        # Shape: (mc_samples,)
-        # Note: We pass the FULL z_complex to the prior (for FFT), not just gathered ones
         log_prior = self.prior.log_prob(z_complex)
-
+        
         # 7. Entropy Term (Posterior Log Prob)
-        # Shape: (mc_samples,)
         log_q = self.surrogate_posterior.log_prob(z_complex)
+        
+        # Reduce prior to joint probability if it returned marginals
+        if len(log_q.shape) < len(log_prior.shape):
+            log_prior = tf.reduce_sum(log_prior, axis=-1)
 
         # 8. Compute ELBO
-        # ELBO = E_q [ log P(Data|z) + log P(z) - log q(z) ]
         elbo = ll_sum + log_prior - log_q
 
         # Average over MC samples
