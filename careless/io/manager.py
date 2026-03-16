@@ -404,6 +404,7 @@ class DataManager():
                 from careless.models.likelihoods.mono import StudentTEv11Likelihood as StudentTLikelihood
             else:
                 from careless.models.likelihoods.mono import NormalLikelihood,StudentTLikelihood
+        from careless.models.likelihoods.background_laue import BackgroundNormalLikelihood
 
         parents = parser.parents
         r_values = parser.dwr
@@ -438,9 +439,15 @@ class DataManager():
         if likelihood is None:
             dof = parser.studentt_likelihood_dof
             if dof is None:
-                likelihood = NormalLikelihood()
+                if parser.include_background:
+                    likelihood = BackgroundNormalLikelihood
+                else:
+                    likelihood = NormalLikelihood()
             else:
-                likelihood = StudentTLikelihood(dof)
+                if parser.include_background:
+                    raise ValueError("Background term not supported with student-t likelihood.")
+                else:
+                    likelihood = StudentTLikelihood(dof)
 
         if scaling_model is None:
             mlp_width = parser.mlp_width

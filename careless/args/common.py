@@ -58,5 +58,10 @@ args_and_kwargs = (
         "action" : "store_true",
         "default" : False,
     }),
-    
+
+    (("--include-background", ),  {
+        "help": "Model the background as an additive per-peak contribution.",
+        "action" : "store_true",
+        "default": False,
+    }),
 )
