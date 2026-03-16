@@ -6,7 +6,12 @@ from careless.models.likelihoods.laue import LaueBase, ConvolvedLikelihood
 
 class BackgroundMLP(tfk.layers.Layer):
     """A simple MLP to predict a strictly positive background from metadata."""
-    def __init__(self, n_layers=3, width=32, leakiness=0.01, **kwargs):
+    def __init__(self, **kwargs):
+        # Hardcode the architecture here to keep the signature clean
+        n_layers = 3
+        width = 32
+        leakiness = 0.01
+        
         super().__init__(**kwargs)
         layers = []
         for _ in range(n_layers):
@@ -26,12 +31,14 @@ class BackgroundMLP(tfk.layers.Layer):
 class BackgroundNormalLikelihood(LaueBase):
     """
     A Custom Laue Likelihood that learns an additive background term B.
+    I_pred = (Sigma * |F|^2) + B(metadata)
     """
-    def __init__(self, n_layers=3, width=32, **kwargs):
-        # We explicitly separate our MLP kwargs from the Layer kwargs
-        super().__init__(**kwargs)
-        # Instantiate the network here, during construction!
-        self.background_network = BackgroundMLP(n_layers=n_layers, width=width)
+    def __init__(self, *args, **kwargs):
+        # We accept *args and **kwargs exactly as LaueBase does
+        super().__init__(*args, **kwargs)
+        
+        # Instantiate the network during construction with no positional args
+        self.background_network = BackgroundMLP()
 
     def dist(self, inputs):
         I_obs = self.get_intensities(inputs)
@@ -41,14 +48,18 @@ class BackgroundNormalLikelihood(LaueBase):
         
         metadata = self.get_metadata(inputs)
         
-        # Call the already-instantiated network
+        # Call the already-instantiated network to get B
         B = self.background_network(metadata)
         
+        # Shift the observation by B to evaluate:
+        # P(I_obs - B | Sigma * |F|^2, sigma) 
+        # which is mathematically P(I_obs | Sigma * |F|^2 + B, sigma)
         loc = I_obs - B
         
         return tfd.Normal(loc, sigma)
 
     def call(self, inputs):
+        # The standard Laue Base wrapper
         harmonic_id = self.get_harmonic_id(inputs)
         likelihood = self.dist(inputs)
         return ConvolvedLikelihood(likelihood, harmonic_id)
