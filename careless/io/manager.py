@@ -440,7 +440,7 @@ class DataManager():
             dof = parser.studentt_likelihood_dof
             if dof is None:
                 if parser.include_background:
-                    likelihood = BackgroundNormalLikelihood
+                    likelihood = BackgroundNormalLikelihood()
                 else:
                     likelihood = NormalLikelihood()
             else:
