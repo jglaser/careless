@@ -465,6 +465,7 @@ class DataManager():
             else:
                 raise ValueError(f"Unsupported scale bijector type, {parser.scale_bijector}")
 
+            pre_scaler = None
             if parser.spectral_file is not None:
                 # Load the 2-column text file
                 data = np.loadtxt(parser.spectral_file)
@@ -473,14 +474,14 @@ class DataManager():
                 x_grid = data[:, 0]
                 y_grid = data[:, 1]
 
-                scaling_model = TabulatedSpectralScaler(
+                pre_scaler = TabulatedSpectralScaler(
                     x_grid=x_grid,
                     y_grid=y_grid,
                     trainable_scale=parser.trainable_spectral_scale,
                     num_grid_points=parser.spectral_grid_points,
                     lorentz_correction=parser.lorentz_correction,
                 )
-            elif parser.image_layers > 0:
+            if parser.image_layers > 0:
                 from careless.models.scaling.image import NeuralImageScaler
                 n_images = np.max(BaseModel.get_image_id(self.inputs)) + 1
                 scaling_model = NeuralImageScaler(
@@ -503,6 +504,9 @@ class DataManager():
                     scaling_model = HybridImageScaler(mlp_scaler, image_scaler)
                 else:
                     scaling_model = mlp_scaler
+
+        if pre_scaler is not None:
+            scaling_model = HybridImageScaler(scaling_model, pre_scaler)
 
         from tensorflow_probability import distributions as tfd
         model = VariationalMergingModel(surrogate_posterior, prior, likelihood, scaling_model, parser.mc_samples, kl_weight=parser.kl_weight)
