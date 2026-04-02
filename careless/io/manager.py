@@ -387,7 +387,7 @@ class DataManager():
         from careless.models.merging.variational import VariationalMergingModel
         from careless.models.scaling.image import HybridImageScaler,ImageScaler
         from careless.models.scaling.nn import MLPScaler
-        from careless.models.scaling.spectral import TabulatedSpectralScaler
+        from careless.models.scaling.spectral import TabulatedSpectralScaleBijector
         if parser is None:
             parser = self.parser
         if parser is None:
@@ -474,7 +474,7 @@ class DataManager():
                 x_grid = data[:, 0]
                 y_grid = data[:, 1]
 
-                pre_scaler = TabulatedSpectralScaler(
+                pre_scaler = TabulatedSpectralScaleBijector(
                     x_grid=x_grid,
                     y_grid=y_grid,
                     trainable_scale=parser.trainable_spectral_scale,

@@ -3,14 +3,17 @@ import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 import numpy as np
-from careless.models.scaling.base import Scaler
 
-class TabulatedSpectralScaler(Scaler):
+# Assuming Scaler is a subclass of tf.keras.layers.Layer or tf.Module
+from careless.models.scaling.base import Scaler 
+
+class TabulatedSpectralScaleBijector(Scaler):
     """
-    A scaler that uses a pre-calculated regular grid lookup table for fast spectral scaling.
+    A layer that takes inputs, calculates a pre-computed scale based on a 
+    regular grid lookup, and returns a tfb.Scale bijector.
     """
     def __init__(self, x_grid, y_grid, trainable_scale=False, initial_value=1.0, num_grid_points=10000,
-                 lorentz_correction=False):
+                 lorentz_correction=False, **kwargs):
         """
         Parameters
         ----------
@@ -25,7 +28,7 @@ class TabulatedSpectralScaler(Scaler):
         num_grid_points : int
             Size of the regular lookup grid.
         """
-        super().__init__()
+        super().__init__(**kwargs)
 
         # 1. Resample onto Regular Grid (NumPy)
         self.x_min = float(np.min(x_grid))
@@ -76,6 +79,7 @@ class TabulatedSpectralScaler(Scaler):
         idx_lo_int = tf.cast(idx_lo, tf.int32)
         idx_hi_int = tf.cast(idx_hi, tf.int32)
         idx_hi_int = tf.minimum(idx_hi_int, self.max_idx_int)
+        
         y_lo = tf.gather(self.y_grid, idx_lo_int)
         y_hi = tf.gather(self.y_grid, idx_hi_int)
         scale = y_lo + weight * (y_hi - y_lo)
@@ -92,4 +96,5 @@ class TabulatedSpectralScaler(Scaler):
         # Force the output to be 1D (BatchSize,) instead of matching wavelengths (BatchSize, 1)
         scale = tf.reshape(scale, [-1])
 
-        return tfd.Deterministic(loc=scale)
+        # RETURN A BIJECTOR INSTEAD OF A DETERMINISTIC DISTRIBUTION
+        return tfb.Scale(scale=scale)
