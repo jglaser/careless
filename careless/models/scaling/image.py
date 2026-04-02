@@ -59,7 +59,7 @@ class HybridImageScaler(Scaler):
         a = self.image_scaler(inputs)
         return tfp.distributions.TransformedDistribution(
             q,
-            tfp.bijectors.Scale(scale=a),
+            tfp.bijectors.Scale(scale=a) if not isinstance(a, tfp.bijectors.Scale) else a,
         )
 
 
