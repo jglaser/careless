@@ -472,7 +472,7 @@ class DataManager():
         """
         from careless.models.merging.surrogate_posteriors import TruncatedNormal, FlowPosterior
         from careless.models.merging.variational import VariationalMergingModel
-        
+
         if parser is None:
             parser = self.parser
         if parser is None:
